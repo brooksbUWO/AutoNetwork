@@ -12,31 +12,6 @@ AutoNetwork manages WiFi lifecycle for ESP32 applications:
 
 ---
 
-## Installation
-
-### PlatformIO
-
-Add to `platformio.ini`:
-
-```ini
-lib_deps =
-    https://github.com/brooksbUWO/AutoNetwork.git
-    https://github.com/ESP32Async/ESPAsyncWebServer.git
-    https://github.com/ESP32Async/AsyncTCP.git
-    bblanchon/ArduinoJson@^7.0.0
-```
-
-### Arduino IDE
-
-1. Download library ZIP from GitHub
-2. Sketch > Include Library > Add .ZIP Library
-3. Install dependencies:
-   - [ESPAsyncWebServer](https://github.com/ESP32Async/ESPAsyncWebServer)
-   - [AsyncTCP](https://github.com/ESP32Async/AsyncTCP)
-   - [ArduinoJson](https://github.com/bblanchon/ArduinoJson) v7.x
-
----
-
 ## Quick Start
 
 Minimal working example:
