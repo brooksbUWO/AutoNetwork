@@ -27,17 +27,14 @@
   "platforms": "espressif32",
   "dependencies": [
     {
-      "name": "ArduinoJson",
-      "version": "^7.0.0"
+      "name": "ArduinoJson"
     },
     {
-      "name": "ESPAsyncWebServer"
+      "name": "ESPAsyncWebServer",
+      "version": "https://github.com/brooksbUWO/ESPAsyncWebServer.git"      
     },
     {
       "name": "AsyncTCP"
-    },
-    {
-      "name": "DNSServer"
     }
   ],
   "export": {
