@@ -15,9 +15,6 @@
 
 // Configuration Macros
 // ****************************************************************************
-// AUTONETWORK_USE_ASYNC_WEBSERVER is permanently set to 1
-// Synchronous WebServer code has been removed
-#define AUTONETWORK_USE_ASYNC_WEBSERVER 1
 
 // ESP-IDF Logging Configuration
 // Set default log level at compile time (can be changed at runtime)
@@ -134,8 +131,6 @@
 #include "AsyncTCP.h"
 #include "AsyncJson.h"
 #include "ESPAsyncWebServer.h"
-#define AUTONETWORK_WEBSERVER AsyncWebServer
-#define AUTONETWORK_REQ_HANDLER AsyncWebHandler
 
 #include "DNSServer.h"
 #include "AutoNetworkConstants.h"
@@ -144,19 +139,6 @@
 
 // Type Definitions and Enumerations
 // ****************************************************************************
-
-/**
- * @brief Connection strategy enumeration for blocking/non-blocking behavior.
- *
- * @details Determines whether AutoNetwork blocks program execution during WiFi
- *          connection attempts and portal operations. Choose based on your
- *          application's concurrency requirements.
- */
-typedef enum
-{
-    NON_BLOCKING = 0,  /**< Non-blocking mode - program continues during connection, call `loop()` for progress */
-    BLOCKING,          /**< Blocking mode - program waits for connection or timeout before returning */
-} AutoNetworkStrategy;
 
 /**
  * @brief WiFi connection status enumeration.
@@ -297,8 +279,8 @@ typedef std::function<void()> AutoNetworkOnWebpageAccessedCallback;
  *          multi-credential storage with priority ordering, WPA2 Enterprise support, and
  *          visual status feedback via LED ticker.
  *
- *          The library supports both blocking and non-blocking connection strategies,
- *          allowing flexibility in application design. The captive portal provides a
+ *          The library requires periodic loop() calls to process connection events and
+ *          portal operations. The captive portal provides a
  *          user-friendly web interface for WiFi configuration accessible from any
  *          smartphone or computer.
  *
@@ -357,7 +339,7 @@ public:
      * @note The web server should be created before constructing AutoNetwork.
      * @note The server is not started automatically - call `begin()` to start.
      */
-    AutoNetwork(AUTONETWORK_WEBSERVER *server);
+    AutoNetwork(AsyncWebServer *server);
 
     // Authentication Methods
     // ========================================================================
@@ -436,13 +418,6 @@ public:
      * @param [in] timeoutMs Timeout in milliseconds (0 = infinite).
      */
     void setPortalTimeout(uint32_t timeoutMs);
-
-    /**
-     * @brief Set connection strategy (blocking or non-blocking).
-     *
-     * @param [in] strategy `BLOCKING` or `NON_BLOCKING`.
-     */
-    void setStrategy(AutoNetworkStrategy strategy);
 
     // Logging Configuration Methods
     // ========================================================================
@@ -592,8 +567,7 @@ public:
      * @param [in] ssid Access Point SSID for captive portal.
      * @param [in] password Access Point password (empty for open network).
      *
-     * @note In blocking mode, this method waits for connection or timeout.
-     * @note In non-blocking mode, returns immediately - call `loop()` for progress.
+     * @note This method returns immediately - call `loop()` for connection progress.
      */
     void autoConnect(const char *ssid, const char *password);
 
@@ -862,34 +836,13 @@ public:
      */
     void end();
 
-    /**
-     * @brief Alias for `loop()` - process AutoNetwork tasks.
-     *
-     * @par Parameters
-     *      None.
-     *
-     * @par Returns
-     *      Nothing.
-     */
-    void handleClient();
-
-    /**
-     * @brief Alias for `loop()` - process AutoNetwork tasks.
-     *
-     * @par Parameters
-     *      None.
-     *
-     * @par Returns
-     *      Nothing.
-     */
-    void handleRequest();
 
     /**
      * @brief Get web server reference.
      *
-     * @return AUTONETWORK_WEBSERVER* Pointer to web server instance.
+     * @return AsyncWebServer* Pointer to web server instance.
      */
-    AUTONETWORK_WEBSERVER *host();
+    AsyncWebServer *host();
 
     /**
      * @brief Check if captive portal is currently active.
@@ -960,7 +913,7 @@ public:
 
 private:
     // Private member variables
-    AUTONETWORK_WEBSERVER *_server;
+    AsyncWebServer *_server;
     AutoNetworkCredential _credential;           // Multi-credential storage
     AutoNetworkCredentialManager _credentialMgr; // High-level credential operations
     AutoNetworkConnectionManager *_connectionMgr = nullptr; // WiFi connection manager
@@ -968,13 +921,13 @@ private:
     AutoNetworkTicker *_ticker = nullptr;        // WiFi status LED ticker
     AutoNetworkPortal *_portal = nullptr;        // Portal manager (new refactored architecture)
     AutoNetworkConfig _config;                   // Configuration storage
-    AUTONETWORK_REQ_HANDLER *_index_handler = nullptr;
-    AUTONETWORK_REQ_HANDLER *_status_handler = nullptr;
-    AUTONETWORK_REQ_HANDLER *_schema_handler = nullptr;
-    AUTONETWORK_REQ_HANDLER *_scan_handler = nullptr;
-    AUTONETWORK_REQ_HANDLER *_save_handler = nullptr;
-    AUTONETWORK_REQ_HANDLER *_clear_handler = nullptr;
-    AUTONETWORK_REQ_HANDLER *_exit_handler = nullptr;
+    AsyncWebHandler *_index_handler = nullptr;
+    AsyncWebHandler *_status_handler = nullptr;
+    AsyncWebHandler *_schema_handler = nullptr;
+    AsyncWebHandler *_scan_handler = nullptr;
+    AsyncWebHandler *_save_handler = nullptr;
+    AsyncWebHandler *_clear_handler = nullptr;
+    AsyncWebHandler *_exit_handler = nullptr;
     bool _serverRunning = false;
     DNSServer *_dns = nullptr;
     bool _dnsRunning = false;
@@ -989,7 +942,6 @@ private:
     // Network configuration and state structure
     struct
     {
-        AutoNetworkStrategy strategy = AutoNetworkStrategy::NON_BLOCKING;
         AutoNetworkConnectionStatus status = AutoNetworkConnectionStatus::DISCONNECTED;
         AutoNetworkOnConnectionStatusCallback status_cb = nullptr;
         String hostname = "autonetwork";

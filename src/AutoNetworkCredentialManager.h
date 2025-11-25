@@ -264,7 +264,7 @@ public:
      *
      * @details Updates the lastUsed field which affects the order returned by `getByRecent()`.
      *          This should be called when a successful connection is made to a network to
-     *          maintain accurate usage tracking for the RECENT connection strategy.
+     *          maintain accurate usage tracking for recent connection ordering.
      *
      * @param [in] ssid SSID of the credential to update.
      * @param [in] timestamp Monotonic timestamp (typically from `_getMonotonicTimestamp()`).

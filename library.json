@@ -1,7 +1,7 @@
 {
   "name": "AutoNetwork",
-  "version": "0.0.1",
-  "description": "Modern WiFi connection manager with captive portal for ESP32. Features automatic credential storage, WPA2 Enterprise support, custom parameters, LED status indicator, and OTA updates. Supports both blocking and non-blocking modes with comprehensive callback system.",
+  "version": "0.0.2",
+  "description": "Modern WiFi connection manager with captive portal for ESP32. Features automatic credential storage, WPA2 Enterprise support, custom parameters, LED status indicator, and OTA updates with comprehensive callback system.",
   "keywords": [
     "wifi",
     "esp32",

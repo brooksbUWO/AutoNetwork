@@ -62,7 +62,6 @@ static const char* portalStateToString(AutoNetworkPortalState state)
 
 PortalState::PortalState()
     : _active(false),
-      _blocking(false),
       _timeout(AUTONETWORK_PORTAL_TIMEOUT),
       _timeStart(0),
       _timeConnect(0),
@@ -142,7 +141,6 @@ void PortalState::setScanState(ScanState state)
 void PortalState::reset()
 {
     _active = false;
-    _blocking = false;
     setState(AutoNetworkPortalState::IDLE);
     clearExit();
     clearSuccessDelay();

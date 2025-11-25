@@ -30,8 +30,6 @@
 #include "AsyncTCP.h"
 #include "AsyncJson.h"
 #include "ESPAsyncWebServer.h"
-#define AUTONETWORK_WEBSERVER AsyncWebServer
-#define AUTONETWORK_REQ_HANDLER AsyncWebHandler
 
 #include "DNSServer.h"
 #include "AutoNetworkParameter.h"
@@ -70,7 +68,7 @@ class AutoNetworkCredentialEntry;
 /** @brief Callback for WiFi connection request (standard WPA2-PSK).
  *  @param [in] ssid SSID to connect to.
  *  @param [in] password WiFi password.
- *  @param [in] save Save credentials to NVS.
+ *  @param [in] autoReconnect Enable WiFi auto-reconnect on connection loss.
  *  @param [in] entry Pointer to credential entry (optional).
  */
 using PortalConnectCallback = std::function<void(const char*, const char*, bool, const AutoNetworkCredentialEntry*)>;
@@ -234,7 +232,7 @@ public:
      * @param server Pointer to web server instance (owned by AutoNetwork)
      * @param parent Pointer to parent AutoNetwork instance for coordination
      */
-    AutoNetworkPortal(AUTONETWORK_WEBSERVER *server, AutoNetwork *parent);
+    AutoNetworkPortal(AsyncWebServer *server, AutoNetwork *parent);
 
     /**
      * @brief Destroy the AutoNetworkPortal object
@@ -464,21 +462,6 @@ public:
      * @param active True to activate portal, false to deactivate
      */
     void setActive(bool active) { _state.setActive(active); }
-
-    /**
-     * @brief Check if portal is in blocking mode
-     *
-     * @return true if blocking
-     * @return false if non-blocking
-     */
-    bool isBlocking() const { return _state.isBlocking(); }
-
-    /**
-     * @brief Set portal blocking mode
-     *
-     * @param blocking True for blocking mode, false for non-blocking
-     */
-    void setBlocking(bool blocking) { _state.setBlocking(blocking); }
 
     /**
      * @brief Get portal timeout value
@@ -818,7 +801,7 @@ public:
 private:
     // Server References
     // ========================================================================
-    AUTONETWORK_WEBSERVER *_server;  // Web server (owned by AutoNetwork)
+    AsyncWebServer *_server;  // Web server (owned by AutoNetwork)
     AutoNetwork *_parent;            // Parent for resource access
     DNSServer *_dns;                 // DNS server (owned by portal)
 
@@ -826,14 +809,14 @@ private:
     // ========================================================================
     bool _serverRunning;                                 // HTTP server active flag
     bool _dnsRunning;                                    // DNS server active flag
-    Vector<AUTONETWORK_REQ_HANDLER *> _handlers;         // HTTP handlers for cleanup
-    AUTONETWORK_REQ_HANDLER *_index_handler = nullptr;   // Main page handler
-    AUTONETWORK_REQ_HANDLER *_status_handler = nullptr;  // Status endpoint
-    AUTONETWORK_REQ_HANDLER *_schema_handler = nullptr;  // Schema endpoint
-    AUTONETWORK_REQ_HANDLER *_scan_handler = nullptr;    // Scan endpoint
-    AUTONETWORK_REQ_HANDLER *_save_handler = nullptr;    // Connect endpoint
-    AUTONETWORK_REQ_HANDLER *_clear_handler = nullptr;   // Clear endpoint
-    AUTONETWORK_REQ_HANDLER *_exit_handler = nullptr;    // Exit endpoint
+    Vector<AsyncWebHandler *> _handlers;         // HTTP handlers for cleanup
+    AsyncWebHandler *_index_handler = nullptr;   // Main page handler
+    AsyncWebHandler *_status_handler = nullptr;  // Status endpoint
+    AsyncWebHandler *_schema_handler = nullptr;  // Schema endpoint
+    AsyncWebHandler *_scan_handler = nullptr;    // Scan endpoint
+    AsyncWebHandler *_save_handler = nullptr;    // Connect endpoint
+    AsyncWebHandler *_clear_handler = nullptr;   // Clear endpoint
+    AsyncWebHandler *_exit_handler = nullptr;    // Exit endpoint
 
     // Request Debouncing
     // ========================================================================

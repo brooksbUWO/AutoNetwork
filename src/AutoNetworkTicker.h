@@ -87,7 +87,7 @@ enum class AutoNetworkTickerPattern
  * @endcode
  *
  * @note Call `update()` in main loop for proper LED animation.
- * @note Ticker operates in non-blocking mode - does not use delay().
+ * @note Ticker does not use delay() - safe for use in main loop.
  */
 class AutoNetworkTicker
 {

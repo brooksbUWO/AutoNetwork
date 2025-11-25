@@ -134,27 +134,6 @@ public:
      */
     void setActive(bool active) { _active = active; }
 
-    /**
-     * @brief Check if portal is in blocking mode.
-     *
-     * @par Parameters
-     *      None.
-     *
-     * @return true if portal blocks in `begin()`.
-     * @return false if portal runs non-blocking.
-     */
-    bool isBlocking() const { return _blocking; }
-
-    /**
-     * @brief Set portal blocking mode.
-     *
-     * @param [in] blocking True for blocking mode, false for non-blocking.
-     *
-     * @par Returns
-     *      Nothing.
-     */
-    void setBlocking(bool blocking) { _blocking = blocking; }
-
     // Timeout Management
     // ========================================================================
 
@@ -1215,7 +1194,6 @@ private:
     // Core State
     // ========================================================================
     bool _active;
-    bool _blocking;
     uint32_t _timeout;
     uint32_t _timeStart;
     uint32_t _timeConnect;

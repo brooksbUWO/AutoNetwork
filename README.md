@@ -238,6 +238,8 @@ if (autonetwork.begin()) {
 
 Process WiFi state machine. **Call first in main loop.**
 
+**Note:** `loop()` is the only method for processing AutoNetwork tasks. Previous alias methods (`handleClient()`, `handleRequest()`) have been removed for clarity.
+
 ```cpp
 void loop() {
     autonetwork.loop();

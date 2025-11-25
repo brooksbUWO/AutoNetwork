@@ -53,7 +53,7 @@ const uint32_t HEAP_GOOD_THRESHOLD = 50000;    // Free heap good status threshol
 // Constructor/Destructor
 // ****************************************************************************
 
-AutoNetworkPortal::AutoNetworkPortal(AUTONETWORK_WEBSERVER *server, AutoNetwork *parent)
+AutoNetworkPortal::AutoNetworkPortal(AsyncWebServer *server, AutoNetwork *parent)
     : _server(server),
       _parent(parent),
       _dns(nullptr),
@@ -187,7 +187,6 @@ void AutoNetworkPortal::start()
 
     // Store time of Portal start
     _state.setActive(true);
-    _state.setBlocking(true);
     _state.setTimeStart(millis());
 
     // Access config via callback
@@ -696,7 +695,6 @@ void AutoNetworkPortal::_processStateMachine()
                 AN_LOGI(TAG, "  Portal closing now - device will operate in STA mode");
                 stop(); // Stop portal
                 _state.setState(AutoNetworkPortalState::IDLE);
-                _state.setBlocking(false);
                 _state.clearSuccessDelay(); // Reset for next connection
             }
         }
@@ -704,8 +702,6 @@ void AutoNetworkPortal::_processStateMachine()
         {
             AN_LOGI(TAG, "Connection successful, portal retained (retainPortal=true)");
             AN_LOGI(TAG, "  Portal remains open in AP+STA mode for reconfiguration");
-            // Keep portal running but mark as non-blocking
-            _state.setBlocking(false);
             // Transition to IDLE but keep portal active
             _state.setState(AutoNetworkPortalState::IDLE);
         }
@@ -716,7 +712,6 @@ void AutoNetworkPortal::_processStateMachine()
     {
         // Connection failed - keep portal open for retry
         AN_LOGW(TAG, "Connection failed, portal remains open for retry");
-        _state.setBlocking(false);
         break;
     }
 
@@ -734,12 +729,10 @@ void AutoNetworkPortal::_processStateMachine()
             AN_LOGW(TAG, "Connection timeout, closing portal");
             stop(); // Stop portal
             _state.setState(AutoNetworkPortalState::IDLE);
-            _state.setBlocking(false);
         }
         else
         {
             AN_LOGW(TAG, "Connection timeout, portal retained (retainPortal=true)");
-            _state.setBlocking(false);
         }
         break;
     }

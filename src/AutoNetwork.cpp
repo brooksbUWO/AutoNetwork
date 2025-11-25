@@ -160,7 +160,7 @@ struct AutoNetworkParameterTypeNames paramTypes[] =
 // Class Implementations
 // ****************************************************************************
 
-AutoNetwork::AutoNetwork(AUTONETWORK_WEBSERVER *server)
+AutoNetwork::AutoNetwork(AsyncWebServer *server)
     : _credentialMgr(_credential)
 {
     _server = server;
@@ -175,8 +175,8 @@ AutoNetwork::AutoNetwork(AUTONETWORK_WEBSERVER *server)
     _connectionMgr = new AutoNetworkConnectionManager(_portal, &_credential, _an.status, _established);
 
     // Event callbacks replace friend class access pattern
-    _portal->setConnectCallback([this](const char *ssid, const char *pass, bool blocking, const AutoNetworkCredentialEntry *entry)
-                                { _connect(ssid, pass, blocking, entry); });
+    _portal->setConnectCallback([this](const char *ssid, const char *pass, bool autoReconnect, const AutoNetworkCredentialEntry *entry)
+                                { _connect(ssid, pass, autoReconnect, entry); });
 
     _portal->setConnectEnterpriseCallback([this](const char *ssid, const char *netId, const char *pass)
                                           { _connectEnterprise(ssid, netId, pass); });
@@ -285,11 +285,6 @@ void AutoNetwork::setHostname(const char *hostname)
     _an.hostname = hostname;
 }
 
-void AutoNetwork::setStrategy(AutoNetworkStrategy strategy)
-{
-    _an.strategy = strategy;
-}
-
 // Logging Configuration Methods
 // ==============================================================================
 
@@ -383,19 +378,13 @@ void AutoNetwork::config(AutoNetworkConfig &cfg)
         _portal->setAuthentication(cfg.authUsername.c_str(), cfg.authPassword.c_str());
     }
 
-    // Strategy configuration: concurrency determines blocking behavior
-    // concurrency=true (async) requires NON_BLOCKING strategy
-    // concurrency=false (sync) can use BLOCKING strategy
-    _an.strategy = cfg.serverAsync ? NON_BLOCKING : BLOCKING;
-
     // Store the new configuration
     _config = cfg;
 
-    AN_LOGI(TAG, "[AutoNetwork] Configuration applied: APID=%s, Hostname=%s, Ticker=%s, Strategy=%s",
+    AN_LOGI(TAG, "[AutoNetwork] Configuration applied: APID=%s, Hostname=%s, Ticker=%s",
              cfg.apSSID.c_str(),
              cfg.staHostName.c_str(),
-             cfg.tickerEnable ? "enabled" : "disabled",
-             _an.strategy == NON_BLOCKING ? "NON_BLOCKING" : "BLOCKING");
+             cfg.tickerEnable ? "enabled" : "disabled");
 }
 
 void AutoNetwork::enableTicker(bool enable)
@@ -662,22 +651,6 @@ void AutoNetwork::autoConnect(const char *ssid, const char *password)
         AN_LOGI(TAG, "About to start captive portal...");
         _startPortal();
         AN_LOGI(TAG, "Portal start completed");
-
-        if (_an.strategy == AutoNetworkStrategy::BLOCKING)
-        {
-            AN_LOGD(TAG, "Entering blocking strategy loop");
-
-            while (_portal->isActive() && _portal->isBlocking())
-            {
-                this->loop();
-                yield();
-            }
-
-            if (_portal->isActive())
-            {
-                _stopPortal();
-            }
-        }
     }
 
     // Register root handler
@@ -1063,17 +1036,6 @@ void AutoNetwork::loop()
         }
     }
 
-    // Check scheduled disconnect (from disconnect countdown page - original, not duplicate)
-    if (_portal->isDisconnectScheduled())
-    {
-        if (millis() - _portal->getDisconnectTime() > AUTONETWORK_TIMEOUT_DISCONNECT_MS)
-        {
-            AN_LOGI(TAG, "Disconnect countdown complete - disconnecting from WiFi");
-            _disconnect();
-            _portal->clearDisconnect();
-        }
-    }
-
     // Check portal timeout
     // Portal stays active throughout captive portal phase
     // Timeout only applies when NO stations are connected (idle waiting)
@@ -1119,19 +1081,11 @@ void AutoNetwork::loop()
                 AN_LOGI(TAG, "Stopping portal (retainPortal=false)");
                 _stopPortal();
                 _portal->setState(AutoNetworkPortalState::IDLE);
-                _portal->setBlocking(false);
             }
             else
             {
                 AN_LOGI(TAG, "Portal timeout but retained (retainPortal=true)");
-                _portal->setBlocking(false);
             }
-        }
-        else
-        {
-            // Portal still active (not timed out OR has active stations)
-            // Keep portal in "blocking" mode during active configuration
-            _portal->setBlocking(true);
         }
     }
 
@@ -1583,27 +1537,12 @@ void AutoNetwork::end()
     _stopHTTP();
 }
 
-/**
- * @brief Alias for loop() - process AutoNetwork tasks
- */
-void AutoNetwork::handleClient()
-{
-    loop();
-}
-
-/**
- * @brief Alias for loop() - process AutoNetwork tasks
- */
-void AutoNetwork::handleRequest()
-{
-    loop();
-}
 
 /**
  * @brief Get reference to the web server
- * @return Pointer to AUTONETWORK_WEBSERVER instance
+ * @return Pointer to AsyncWebServer instance
  */
-AUTONETWORK_WEBSERVER *AutoNetwork::host()
+AsyncWebServer *AutoNetwork::host()
 {
     return _server;
 }
