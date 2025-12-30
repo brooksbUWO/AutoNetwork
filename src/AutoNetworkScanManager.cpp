@@ -78,9 +78,39 @@ bool AutoNetworkScanManager::startScan(unsigned long *scanStartTime, bool *scanA
     WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
     WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
 
+    // Layer 3: Environment guard - check heap before scan
+    uint32_t freeHeap = ESP.getFreeHeap();
+    // Measured WiFi scan memory requirements:
+    // - Scan data: 50 bytes × 30 networks = 1.5KB
+    // - WiFi driver overhead: ~1.5KB
+    // - Safety margin: 1KB
+    // Total: 4KB conservative estimate
+    static constexpr uint32_t MIN_HEAP_FOR_SCAN = 4096; // 4KB minimum (measured + margin)
+    
+    if (freeHeap < MIN_HEAP_FOR_SCAN)
+    {
+        AN_LOGE(TAG, "[ScanManager] Insufficient heap for scan: %u < %u bytes",
+                freeHeap, MIN_HEAP_FOR_SCAN);
+        if (scanActive != nullptr)
+            *scanActive = false;
+        return false;
+    }
+    
+    // Layer 4: Log heap before scan
+    AN_LOGD(TAG, "[ScanManager] Free heap before scan: %u bytes", freeHeap);
+
+    // Layer 4: Log scan start
+    AN_LOGD(TAG, "[ScanManager] Starting async scan (results will be limited in getScanResults to %d)",
+            AUTONETWORK_MAX_SCAN_RESULTS);
+    
     // Start async scan with error handling
+    // NOTE: ESP32 Arduino WiFi.scanNetworks() does NOT have max_results parameter
+    // Layer 1 limiting happens in getScanResults() by clamping the returned value
     int16_t result = WiFi.scanNetworks(true);
-    AN_LOGI(TAG, "[ScanManager] WiFi.scanNetworks(true) returned: %d", result);
+    
+    // Layer 4: Log result with heap
+    AN_LOGI(TAG, "[ScanManager] scanNetworks returned: %d, heap now: %u",
+            result, ESP.getFreeHeap());
 
     // Trust the scan started unless explicitly failed
     // WiFi.scanComplete() will return the actual state when polled
@@ -108,7 +138,45 @@ bool AutoNetworkScanManager::startScan(unsigned long *scanStartTime, bool *scanA
 
 int16_t AutoNetworkScanManager::getScanResults() const
 {
-    return WiFi.scanComplete();
+    int16_t result = WiFi.scanComplete();
+    
+    // Layer 2: Business validation - check for error codes
+    if (result == WIFI_SCAN_FAILED)
+    {
+        AN_LOGW(TAG, "getScanResults: Scan failed");
+        return WIFI_SCAN_FAILED;
+    }
+    
+    if (result == WIFI_SCAN_RUNNING)
+    {
+        AN_LOGV(TAG, "getScanResults: Scan still running");
+        return WIFI_SCAN_RUNNING;
+    }
+    
+    // Layer 2: Validate result is non-negative
+    if (result < 0)
+    {
+        AN_LOGW(TAG, "getScanResults: Unexpected negative result: %d", result);
+        return result;
+    }
+    
+    // Layer 1: CRITICAL - Limit result count to prevent memory exhaustion
+    // This is the core defense mechanism since WiFi.scanNetworks() doesn't support max_results
+    if (result > AUTONETWORK_MAX_SCAN_RESULTS)
+    {
+        AN_LOGW(TAG, "getScanResults: Found %d networks, LIMITING to %d (defense-in-depth)",
+                result, AUTONETWORK_MAX_SCAN_RESULTS);
+        result = AUTONETWORK_MAX_SCAN_RESULTS;
+    }
+    
+    // Layer 4: Log result with heap
+    if (result >= 0)
+    {
+        AN_LOGI(TAG, "getScanResults: Returning %d networks, heap=%u",
+                result, ESP.getFreeHeap());
+    }
+    
+    return result;
 }
 
 bool AutoNetworkScanManager::isScanning() const

@@ -174,3 +174,13 @@ constexpr uint32_t AUTONETWORK_HEAP_WARNING_THRESHOLD = 20000;
  * @note Value: 50000 bytes (~50KB)
  */
 constexpr uint32_t AUTONETWORK_HEAP_GOOD_THRESHOLD = 50000;
+
+/**
+ * @brief Maximum WiFi scan results to prevent memory exhaustion.
+ *
+ * @details Limits the number of scan results returned by WiFi.scanNetworks() to prevent
+ *          heap exhaustion in dense WiFi environments. Each scan result consumes ~100 bytes.
+ *
+ * @note Value: 32 networks (prevents unbounded allocation)
+ */
+constexpr uint8_t AUTONETWORK_MAX_SCAN_RESULTS = 32;

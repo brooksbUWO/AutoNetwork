@@ -931,6 +931,9 @@ private:
     bool _serverRunning = false;
     DNSServer *_dns = nullptr;
     bool _dnsRunning = false;
+    
+    // Hostname management
+    String _pendingHostname;  // Hostname to apply when STA mode is ready
 
     // WiFi disconnection and reconnection tracking
     bool _established = false;        // Track if WiFi was previously connected
@@ -980,8 +983,8 @@ private:
     } _an;
 
     // Private helper functions
-    void _connect(const char *ssid, const char *password, bool autoreconnect = false, const AutoNetworkCredentialEntry *credential = nullptr);
-    bool _connectEnterprise(const char *ssid, const char *netid, const char *password);
+    void _connect(const char* ssid, const char* password, bool autoreconnect = false, const AutoNetworkCredentialEntry* credential = nullptr);
+    bool _connectEnterprise(const char* ssid, const char* netid, const char* password);
     void _disconnect();
     bool _isIp(String str);
     WiFiMode_t _determineWiFiMode() const;  // Helper for mode switching decision logic
@@ -1044,6 +1047,37 @@ private:
      *      Nothing.
      */
     void _stopMDNS();
+
+    /**
+     * @brief Set WiFi hostname with 4-layer defensive validation.
+     *
+     * @details Ensures WiFi.setHostname() called with proper ordering and validation:
+     *          - Layer 1: Check WiFi mode is set (not NULL)
+     *          - Layer 2: Validate hostname value and mode
+     *          - Layer 3: Handle test environment differences
+     *          - Layer 4: Log full state transitions
+     *
+     * @param [in] hostname Hostname to set (null-terminated string)
+     *
+     * @par Returns
+     *      Nothing.
+     */
+    void _setHostname(const char* hostname);
+    
+    /**
+     * @brief Apply pending hostname if STA mode is now active.
+     * 
+     * @details Called internally when WiFi mode changes to STA or AP_STA.
+     *          If a hostname was set before WiFi initialization, this method
+     *          applies it once the appropriate mode is active.
+     *
+     * @par Parameters
+     *      None.
+     *
+     * @par Returns
+     *      Nothing.
+     */
+    void _applyPendingHostname();
 
 protected:
     static bool _onAPFilter(AsyncWebServerRequest *request);

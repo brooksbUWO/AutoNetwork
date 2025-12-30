@@ -131,7 +131,14 @@
 #include <LittleFS.h>
 #include <Update.h>
 #define FILESYSTEM LittleFS
-#include "esp_wpa2.h"
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    // ESP-IDF 5.0+: Use new EAP client APIs
+    #include "esp_eap_client.h"
+#else
+    // ESP-IDF 4.x and earlier: Use deprecated WPA2 APIs
+    #include "esp_wpa2.h"
+#endif
 #include <ESPmDNS.h>
 
 // ESP-IDF Logging Tag
@@ -589,8 +596,7 @@ void AutoNetwork::autoConnect(const char *ssid, const char *password)
             // to default hostname format: esp32-XXXXXX
             if (_an.hostname != "")
             {
-                WiFi.setHostname(_an.hostname.c_str());
-                AN_LOGD(TAG, "Hostname set to: %s", _an.hostname.c_str());
+                _setHostname(_an.hostname.c_str());
             }
 
             // Attempt connection
@@ -1168,6 +1174,9 @@ void AutoNetwork::_connect(
     bool flagAutoReconnect,
     const AutoNetworkCredentialEntry *credential)
 {
+    // Apply pending hostname if WiFi mode is now suitable (STA or AP_STA)
+    _applyPendingHostname();
+    
     // Delegate to connection manager
     _connectionMgr->connect(ssid, password, flagAutoReconnect, credential);
 }
@@ -1454,36 +1463,9 @@ bool AutoNetwork::begin()
         WiFi.persistent(false);
         WiFi.mode(WIFI_STA);
         AN_LOGI(TAG, "WiFi subsystem initialized (persistence disabled)");
-    }
-
-    // ALWAYS generate unique AP name from MAC address (plan requirement)
-    String macAddr = WiFi.macAddress();
-    if (macAddr.length() > 0 && macAddr != "00:00:00:00:00:00")
-    {
-        // Verify valid MAC
-        macAddr.replace(":", "");
-        _config.apSSID = "ESP32_" + macAddr;
-        _config.staHostName = _config.apSSID;
-        _an.hostname = _config.staHostName;
-
-        // Apply generated AP name to portal
-        _portal->setAPCredentials(_config.apSSID.c_str(), _config.apPassword.c_str());
-        AN_LOGI(TAG, "Generated unique AP name from MAC: %s", _config.apSSID.c_str());
-    }
-    else
-    {
-        AN_LOGW(TAG, "Failed to read MAC address, using chip ID fallback");
-        uint32_t chipId = 0;
-        for (uint8_t i = 0; i < 32; i = i + 8)  // Extract 4 bytes (32 bits)
-        {
-            chipId |= ((ESP.getEfuseMac() >> (40 - i)) & 0xff) << i;
-        }
-        _config.apSSID = "ESP32_" + String(chipId, HEX);
-        _config.apSSID.toUpperCase();
-        _config.staHostName = _config.apSSID;
-        _an.hostname = _config.staHostName;
-        _portal->setAPCredentials(_config.apSSID.c_str(), _config.apPassword.c_str());
-        AN_LOGI(TAG, "Generated unique AP name from chip ID: %s", _config.apSSID.c_str());
+        
+        // Apply any hostname that was set before WiFi initialization
+        _applyPendingHostname();
     }
 
     // Register WiFi event callback for mDNS auto-configuration
@@ -1808,6 +1790,81 @@ void AutoNetwork::_stopMDNS()
 {
     MDNS.end();
     AN_LOGI(TAG, "mDNS stopped");
+}
+
+// _setHostname - Set WiFi hostname with defensive validation
+// ****************************************************************************
+void AutoNetwork::_setHostname(const char* hostname)
+{
+    // Layer 1: Entry validation - hostname requirements
+    if (hostname == nullptr || hostname[0] == '\0')
+    {
+        AN_LOGW(TAG, "_setHostname rejected: null or empty");
+        return;
+    }
+    
+    wifi_mode_t currentMode = WiFi.getMode();
+    AN_LOGD(TAG, "_setHostname: hostname=%s, current_mode=%d", 
+            hostname, currentMode);
+    
+    // Layer 2: Business validation - hostname only meaningful in STA/AP_STA mode
+    if (currentMode == WIFI_MODE_NULL || currentMode == WIFI_MODE_AP)
+    {
+        AN_LOGW(TAG, "_setHostname: WiFi mode %d does not support hostname (STA required)", 
+                currentMode);
+        AN_LOGW(TAG, "Hostname '%s' will be applied when STA mode is activated", hostname);
+        
+        // Store for later application (DO NOT force mode change)
+        _pendingHostname = String(hostname);
+        return;
+    }
+    
+    // Layer 3: Apply hostname in valid mode (STA or AP_STA)
+    #ifdef UNIT_TEST
+    AN_LOGD(TAG, "_setHostname: UNIT_TEST mode");
+    #endif
+    
+    bool result = WiFi.setHostname(hostname);
+    
+    // Layer 4: Log result with verification
+    if (result)
+    {
+        String actualHostname = WiFi.getHostname();
+        if (actualHostname == hostname)
+        {
+            AN_LOGI(TAG, "_setHostname: Success - hostname=%s (mode=%d)", 
+                    hostname, currentMode);
+        }
+        else
+        {
+            AN_LOGW(TAG, "_setHostname: Set returned true but hostname mismatch: wanted=%s, got=%s",
+                    hostname, actualHostname.c_str());
+        }
+    }
+    else
+    {
+        #ifdef UNIT_TEST
+        AN_LOGD(TAG, "_setHostname: WiFi.setHostname() returned false (expected in test)");
+        #else
+        AN_LOGW(TAG, "_setHostname: WiFi.setHostname() returned false");
+        #endif
+    }
+}
+
+// _applyPendingHostname - Apply hostname deferred from pre-initialization
+// ****************************************************************************
+void AutoNetwork::_applyPendingHostname()
+{
+    if (_pendingHostname.length() > 0)
+    {
+        wifi_mode_t currentMode = WiFi.getMode();
+        if (currentMode == WIFI_MODE_STA || currentMode == WIFI_MODE_APSTA)
+        {
+            AN_LOGI(TAG, "Applying pending hostname: %s", _pendingHostname.c_str());
+            _setHostname(_pendingHostname.c_str());
+            _pendingHostname = "";  // Clear after application
+        }
+    }
 }
 
 // Root Content Configuration Methods

@@ -30,10 +30,6 @@
       "name": "ArduinoJson"
     },
     {
-      "name": "ESPAsyncWebServer",
-      "version": "https://github.com/brooksbUWO/ESPAsyncWebServer.git"      
-    },
-    {
       "name": "AsyncTCP"
     }
   ],

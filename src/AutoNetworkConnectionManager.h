@@ -177,9 +177,9 @@ public:
      * @see connect()
      */
     bool connectEnterprise(
-        const char *ssid,
-        const char *netid,
-        const char *password);
+        const char* ssid,
+        const char* netid,
+        const char* password);
 
     /**
      * @brief Disconnect from WiFi network.
@@ -343,6 +343,4 @@ private:
      *      Unsigned long timestamp in seconds since boot.
      */
     unsigned long _getMonotonicTimestamp() const;
-
-    static constexpr const char *TAG = "AutoNetworkConnMgr"; ///< Log tag
 };

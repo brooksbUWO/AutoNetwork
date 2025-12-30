@@ -22,7 +22,8 @@
 
 // Constants
 // ****************************************************************************
-static const char *TAG = "AutoNetworkCredential";
+static const char* TAG = "AutoNetworkCredential";
+static const size_t MAX_BLOB_SIZE = 8192; // Limit blob size to prevent memory issues
 
 // Class Implementation
 // ****************************************************************************
@@ -30,7 +31,8 @@ static const char *TAG = "AutoNetworkCredential";
 AutoNetworkCredential::AutoNetworkCredential()
     : _entryCount(0), _containerSize(0), _isDirty(false)
 {
-    // Initialize NVS flash storage
+    // Layer 3: Environment guard - initialize NVS
+    #ifndef UNIT_TEST
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
@@ -46,8 +48,13 @@ AutoNetworkCredential::AutoNetworkCredential()
     }
     else
     {
+        // Layer 4: Log successful initialization
         AN_LOGD(TAG, "NVS flash initialized successfully");
     }
+    #else
+    // Layer 3: In test environment, use mock NVS
+    AN_LOGD(TAG, "UNIT_TEST mode - using mock NVS");
+    #endif
 
     _load();
 }
@@ -71,11 +78,33 @@ void AutoNetworkCredential::_load()
 // Save or update a credential entry
 bool AutoNetworkCredential::save(const AutoNetworkCredentialEntry &entry)
 {
+    // Layer 4: Log save operation entry
+    AN_LOGD(TAG, "save() entry: ssid=%s", entry.ssid.c_str());
+    
+    // Layer 1: Entry validation (defense-in-depth with manager layer)
     if (entry.ssid.isEmpty())
     {
-        AN_LOGW(TAG, "Cannot save credential with empty SSID");
+        AN_LOGW(TAG, "save() rejected: empty SSID");
         return false;
     }
+
+    // Layer 4: Log NVS access attempt
+    AN_LOGV(TAG, "Opening NVS namespace: %s", AUTONETWORK_CREDENTIAL_NAMESPACE);
+    
+    // Layer 1: Entry validation - verify NVS accessible
+    if (!_prefs.begin(AUTONETWORK_CREDENTIAL_NAMESPACE, false))
+    {
+        AN_LOGE(TAG, "save: Cannot open namespace '%s' - NVS not initialized?",
+                AUTONETWORK_CREDENTIAL_NAMESPACE);
+        return false;
+    }
+    
+    // Layer 2: Business validation - verify namespace operational
+    size_t freeEntries = _prefs.freeEntries();
+    AN_LOGD(TAG, "NVS namespace '%s' has %u free entries",
+            AUTONETWORK_CREDENTIAL_NAMESPACE, freeEntries);
+    
+    _prefs.end();  // Close after check, _commit() will reopen
 
     // Check if credential already exists
     uint8_t existingIndex = _findBySSID(entry.ssid.c_str());
@@ -101,6 +130,14 @@ bool AutoNetworkCredential::save(const AutoNetworkCredentialEntry &entry)
 
     _isDirty = true;
     size_t written = _commit();
+    
+    // Layer 4: Log result
+    if (written > 0) {
+        AN_LOGI(TAG, "Credential saved successfully: %s", entry.ssid.c_str());
+    } else {
+        AN_LOGW(TAG, "Credential save failed: %s", entry.ssid.c_str());
+    }
+    
     return (written > 0);
 }
 
@@ -111,7 +148,7 @@ bool AutoNetworkCredential::load(uint8_t index, AutoNetworkCredentialEntry &entr
 }
 
 // Delete credential by SSID
-bool AutoNetworkCredential::del(const char *ssid)
+bool AutoNetworkCredential::del(const char* ssid)
 {
     uint8_t index = _findBySSID(ssid);
     if (index >= _credentials.size())
@@ -155,7 +192,7 @@ uint8_t AutoNetworkCredential::entries()
 }
 
 // Check if credential exists by SSID
-bool AutoNetworkCredential::exists(const char *ssid)
+bool AutoNetworkCredential::exists(const char* ssid)
 {
     return (_findBySSID(ssid) < _credentials.size());
 }
@@ -227,7 +264,7 @@ bool AutoNetworkCredential::getByPriority(uint8_t index, AutoNetworkCredentialEn
 }
 
 // Get credential by SSID
-bool AutoNetworkCredential::getBySSID(const char *ssid, AutoNetworkCredentialEntry &entry)
+bool AutoNetworkCredential::getBySSID(const char* ssid, AutoNetworkCredentialEntry &entry)
 {
     uint8_t index = _findBySSID(ssid);
     if (index >= _credentials.size())
@@ -240,7 +277,7 @@ bool AutoNetworkCredential::getBySSID(const char *ssid, AutoNetworkCredentialEnt
 }
 
 // Update lastUsed timestamp for a credential
-bool AutoNetworkCredential::updateLastUsed(const char *ssid, uint32_t timestamp)
+bool AutoNetworkCredential::updateLastUsed(const char* ssid, uint64_t timestamp)
 {
     uint8_t index = _findBySSID(ssid);
     if (index >= _credentials.size())
@@ -249,16 +286,31 @@ bool AutoNetworkCredential::updateLastUsed(const char *ssid, uint32_t timestamp)
         return false;
     }
 
+    // Layer 2: Business validation - check monotonic increase
+    uint64_t oldTimestamp = _credentials[index].lastUsed;
+    if (timestamp < oldTimestamp)
+    {
+        AN_LOGW(TAG, "Timestamp not increasing for %s: old=%llu, new=%llu (clock went backwards?)",
+                ssid, oldTimestamp, timestamp);
+        // Still allow the update in case clock was reset
+    }
+    else if (timestamp == oldTimestamp)
+    {
+        AN_LOGD(TAG, "Timestamp unchanged for %s: %llu", ssid, timestamp);
+    }
+
     _credentials[index].lastUsed = timestamp;
     _isDirty = true;
 
     size_t written = _commit();
-    AN_LOGD(TAG, "Updated lastUsed for %s: %u", ssid, timestamp);
+
+    // Layer 4: Log old→new timestamp transition
+    AN_LOGD(TAG, "Updated lastUsed for %s: %llu (was %llu)", ssid, timestamp, oldTimestamp);
     return (written > 0);
 }
 
 // Update priority for a credential
-bool AutoNetworkCredential::updatePriority(const char *ssid, uint8_t priority)
+bool AutoNetworkCredential::updatePriority(const char* ssid, uint8_t priority)
 {
     uint8_t index = _findBySSID(ssid);
     if (index >= _credentials.size())
@@ -279,8 +331,13 @@ bool AutoNetworkCredential::updatePriority(const char *ssid, uint8_t priority)
 size_t AutoNetworkCredential::_commit()
 {
     // Calculate serialization size
-    // Format: [count:1][size:2][entry1][entry2]...[entryN][\0]
+    // Format: [magic:8][count:1][size:2][entry1][entry2]...[entryN][\0]
     size_t blobSize = 0;
+
+    // Magic identifier (8 bytes)
+    const char* magic = AUTONETWORK_CREDENTIAL_IDENTIFIER;
+    size_t magicLen = strlen(magic);
+    blobSize += magicLen;
 
     // Header: count (1 byte) + container size (2 bytes)
     blobSize += sizeof(uint8_t) + sizeof(uint16_t);
@@ -315,8 +372,8 @@ size_t AutoNetworkCredential::_commit()
             blobSize += 5 * sizeof(uint32_t); // ip, gateway, netmask, dns1, dns2
         }
 
-        // lastUsed (4 bytes)
-        blobSize += sizeof(uint32_t);
+        // lastUsed (8 bytes)
+        blobSize += sizeof(uint64_t);
 
         // priority (1 byte)
         blobSize += sizeof(uint8_t);
@@ -328,20 +385,31 @@ size_t AutoNetworkCredential::_commit()
         blobSize += sizeof('\0');
     }
 
+    if (blobSize > MAX_BLOB_SIZE)
+    {
+        AN_LOGE(TAG, "Credential blob too large: %d (max %d)", blobSize, MAX_BLOB_SIZE);
+        return 0;
+    }
+
     // Allocate buffer
-    uint8_t *blob = (uint8_t *)malloc(blobSize);
-    if (!blob)
+    uint8_t* blob = static_cast<uint8_t*>(malloc(blobSize));
+    if (blob == nullptr)
     {
         AN_LOGE(TAG, "Failed to allocate %d bytes for credential blob", blobSize);
         return 0;
     }
 
     // Serialize to buffer
+    // Use uint16_t for offset since MAX_BLOB_SIZE (8192) < UINT16_MAX (65535)
     uint16_t offset = 0;
+
+    // Magic identifier
+    memcpy(&blob[offset], magic, magicLen);
+    offset += magicLen;
 
     // Header
     blob[offset++] = (uint8_t)_credentials.size(); // Entry count
-    _containerSize = blobSize - 3; // Container size (excluding count and size fields)
+    _containerSize = blobSize - magicLen - 3; // Container size (excluding magic, count and size fields)
     blob[offset++] = (uint8_t)(_containerSize & 0xFF); // Low byte
     blob[offset++] = (uint8_t)((_containerSize >> 8) & 0xFF); // High byte
 
@@ -401,8 +469,8 @@ size_t AutoNetworkCredential::_commit()
         }
 
         // lastUsed
-        memcpy(&blob[offset], &cred.lastUsed, sizeof(uint32_t));
-        offset += sizeof(uint32_t);
+        memcpy(&blob[offset], &cred.lastUsed, sizeof(uint64_t));
+        offset += sizeof(uint64_t);
 
         // priority
         blob[offset++] = cred.priority;
@@ -443,24 +511,50 @@ size_t AutoNetworkCredential::_commit()
 // Private helper: Deserialize credentials from binary blob in NVS
 uint8_t AutoNetworkCredential::_import()
 {
+    // Layer 4: Debug instrumentation - log start of import
+    AN_LOGD(TAG, "_import: Starting credential blob import");
+    
     if (!_prefs.begin(AUTONETWORK_CREDENTIAL_NAMESPACE, true))
     {
-        AN_LOGE(TAG, "Failed to open preferences for read");
+        AN_LOGW(TAG, "_import: Failed to open preferences namespace");
         return 0;
     }
 
     // Get blob size
     size_t blobSize = _prefs.getBytesLength(AUTONETWORK_CREDENTIAL_BLOB_KEY);
+    
+    // Layer 4: Log blob size for forensics
+    AN_LOGD(TAG, "_import: Blob size in NVS: %u bytes", blobSize);
+    
+    // Layer 1: Entry validation - handle empty blob (first boot)
     if (blobSize == 0)
     {
-        AN_LOGI(TAG, "No saved credentials found");
+        AN_LOGD(TAG, "_import: No credential blob found (first boot)");
+        _prefs.end();
+        return 0;
+    }
+    
+    // Layer 1: Entry validation - minimum blob size check
+    // Minimum valid NEW format blob: magic(8) + count(1) + containerSize(2) + terminator(1) = 12 bytes
+    static constexpr size_t MIN_BLOB_SIZE = 12;
+    if (blobSize < MIN_BLOB_SIZE)
+    {
+        AN_LOGE(TAG, "_import rejected: blob size %u < minimum %u", blobSize, MIN_BLOB_SIZE);
+        _prefs.end();
+        return 0;
+    }
+    
+    // Layer 3: Environment guard - prevent memory exhaustion
+    if (blobSize > MAX_BLOB_SIZE)
+    {
+        AN_LOGE(TAG, "_import rejected: blob size %u exceeds MAX_BLOB_SIZE %u", blobSize, MAX_BLOB_SIZE);
         _prefs.end();
         return 0;
     }
 
     // Allocate buffer
-    uint8_t *blob = (uint8_t *)malloc(blobSize);
-    if (!blob)
+    uint8_t* blob = static_cast<uint8_t*>(malloc(blobSize));
+    if (blob == nullptr)
     {
         AN_LOGE(TAG, "Failed to allocate %d bytes for reading credentials", blobSize);
         _prefs.end();
@@ -478,13 +572,46 @@ uint8_t AutoNetworkCredential::_import()
         return 0;
     }
 
-    // Parse header
+    // Layer 2: Business validation - check magic identifier
+    // Use uint16_t for offset since MAX_BLOB_SIZE (8192) < UINT16_MAX (65535)
     uint16_t offset = 0;
+    const char* magic = AUTONETWORK_CREDENTIAL_IDENTIFIER;
+    size_t magicLen = strlen(magic);
+    
+    // Validate magic length is reasonable (defensive programming)
+    if (magicLen == 0 || magicLen > 32)
+    {
+        AN_LOGE(TAG, "_import rejected: invalid magic identifier length %u", magicLen);
+        free(blob);
+        return 0;
+    }
+    
+    if (offset + magicLen > blobSize)
+    {
+        AN_LOGE(TAG, "_import rejected: blob too small for magic check");
+        free(blob);
+        return 0;
+    }
+    
+    if (memcmp(blob + offset, magic, magicLen) != 0)
+    {
+        AN_LOGE(TAG, "_import rejected: invalid magic identifier (old format or corrupted blob)");
+        free(blob);
+        return 0;
+    }
+    offset += magicLen;
+
+    // Parse header
+    // Layer 4: Debug instrumentation - log offset for entry count
+    AN_LOGD(TAG, "_import: Reading entry count at offset %u", offset);
     uint8_t count = blob[offset++];
+    
+    // Layer 4: Debug instrumentation - log offset for container size
+    AN_LOGD(TAG, "_import: Reading container size at offset %u", offset);
     _containerSize = blob[offset++]; // Low byte
     _containerSize |= ((uint16_t)blob[offset++] << 8); // High byte
 
-    AN_LOGI(TAG, "Importing %d credentials from blob", count);
+    AN_LOGI(TAG, "_import: Found %u credentials, container size %u", count, _containerSize);
 
     // Parse entries
     _credentials.clear();
@@ -494,35 +621,100 @@ uint8_t AutoNetworkCredential::_import()
     {
         AutoNetworkCredentialEntry entry;
 
-        // SSID
-        entry.ssid = String((const char *)&blob[offset]);
-        offset += entry.ssid.length() + 1;
+        // SSID - validate null terminator exists within bounds
+        // Layer 4: Debug instrumentation - log SSID offset
+        AN_LOGV(TAG, "_import: Reading SSID at offset %u", offset);
+        if (offset >= blobSize) {
+            AN_LOGE(TAG, "Blob parse error: SSID offset out of bounds");
+            free(blob);
+            return _credentials.size();
+        }
+        const char* ssidPtr = (const char*)&blob[offset];
+        size_t maxLen = blobSize - offset;
+        size_t ssidLen = strnlen(ssidPtr, maxLen);
+        if (ssidLen == maxLen) {
+            AN_LOGE(TAG, "Blob parse error: unterminated SSID string");
+            free(blob);
+            return _credentials.size();
+        }
+        entry.ssid = String(ssidPtr);
+        offset += ssidLen + 1;
 
-        // Password
-        entry.password = String((const char *)&blob[offset]);
-        offset += entry.password.length() + 1;
+        // Password - validate null terminator exists within bounds
+        // Layer 4: Debug instrumentation - log password offset
+        AN_LOGV(TAG, "_import: Reading password at offset %u", offset);
+        if (offset >= blobSize) {
+            AN_LOGE(TAG, "Blob parse error: password offset out of bounds");
+            free(blob);
+            return _credentials.size();
+        }
+        const char* passPtr = (const char*)&blob[offset];
+        maxLen = blobSize - offset;
+        size_t passLen = strnlen(passPtr, maxLen);
+        if (passLen == maxLen) {
+            AN_LOGE(TAG, "Blob parse error: unterminated password string");
+            free(blob);
+            return _credentials.size();
+        }
+        entry.password = String(passPtr);
+        offset += passLen + 1;
 
-        // BSSID
+        // BSSID - bounds check for 6 bytes
+        if (offset + AUTONETWORK_BSSID_LENGTH > blobSize) {
+            AN_LOGE(TAG, "Blob parse error: BSSID offset out of bounds");
+            free(blob);
+            return _credentials.size();
+        }
         memcpy(entry.bssid, &blob[offset], AUTONETWORK_BSSID_LENGTH);
         offset += AUTONETWORK_BSSID_LENGTH;
 
-        // Enterprise flag
+        // Enterprise flag - bounds check for 1 byte
+        if (offset >= blobSize) {
+            AN_LOGE(TAG, "Blob parse error: enterprise flag offset out of bounds");
+            free(blob);
+            return _credentials.size();
+        }
         entry.enterprise = (blob[offset++] != 0);
 
         // Enterprise NetID (only if enterprise)
         if (entry.enterprise)
         {
-            entry.enterpriseNetId = String((const char *)&blob[offset]);
-            offset += entry.enterpriseNetId.length() + 1;
+            // Validate null terminator exists within bounds
+            if (offset >= blobSize) {
+                AN_LOGE(TAG, "Blob parse error: enterpriseNetId offset out of bounds");
+                free(blob);
+                return _credentials.size();
+            }
+            const char* netIdPtr = (const char*)&blob[offset];
+            size_t netIdMaxLen = blobSize - offset;
+            size_t netIdLen = strnlen(netIdPtr, netIdMaxLen);
+            if (netIdLen == netIdMaxLen) {
+                AN_LOGE(TAG, "Blob parse error: unterminated enterpriseNetId string");
+                free(blob);
+                return _credentials.size();
+            }
+            entry.enterpriseNetId = String(netIdPtr);
+            offset += netIdLen + 1;
         }
 
-        // DHCP flag
+        // DHCP flag - bounds check for 1 byte
+        if (offset >= blobSize) {
+            AN_LOGE(TAG, "Blob parse error: DHCP flag offset out of bounds");
+            free(blob);
+            return _credentials.size();
+        }
         uint8_t dhcpFlag = blob[offset++];
         entry.dhcp = (dhcpFlag == 0); // 0=DHCP, 1=Static
 
-        // Static IP config (only if not DHCP)
+        // Static IP config (only if not DHCP) - bounds check for 5 x uint32_t = 20 bytes
         if (!entry.dhcp)
         {
+            const size_t staticIpSize = 5 * sizeof(uint32_t);
+            if (offset + staticIpSize > blobSize) {
+                AN_LOGE(TAG, "Blob parse error: static IP config out of bounds");
+                free(blob);
+                return _credentials.size();
+            }
             uint32_t ip, gateway, netmask, dns1, dns2;
             memcpy(&ip, &blob[offset], sizeof(uint32_t));
             offset += sizeof(uint32_t);
@@ -542,11 +734,23 @@ uint8_t AutoNetworkCredential::_import()
             entry.dns2 = IPAddress(dns2);
         }
 
-        // lastUsed
-        memcpy(&entry.lastUsed, &blob[offset], sizeof(uint32_t));
-        offset += sizeof(uint32_t);
+        // lastUsed - bounds check for uint64_t (8 bytes)
+        // Layer 4: Debug instrumentation - log lastUsed offset (critical for type mismatch detection)
+        AN_LOGV(TAG, "_import: Reading lastUsed (uint64_t) at offset %u", offset);
+        if (offset + sizeof(uint64_t) > blobSize) {
+            AN_LOGE(TAG, "Blob parse error: lastUsed offset out of bounds");
+            free(blob);
+            return _credentials.size();
+        }
+        memcpy(&entry.lastUsed, &blob[offset], sizeof(uint64_t));
+        offset += sizeof(uint64_t);
 
-        // priority
+        // priority - bounds check for 1 byte
+        if (offset >= blobSize) {
+            AN_LOGE(TAG, "Blob parse error: priority offset out of bounds");
+            free(blob);
+            return _credentials.size();
+        }
         entry.priority = blob[offset++];
 
         _credentials.push_back(entry);
@@ -555,12 +759,13 @@ uint8_t AutoNetworkCredential::_import()
 
     free(blob);
 
-    AN_LOGI(TAG, "Successfully imported %d credentials", _credentials.size());
+    // Layer 4: Debug instrumentation - log final result
+    AN_LOGI(TAG, "_import: Successfully loaded %u credentials from blob", _credentials.size());
     return _credentials.size();
 }
 
 // Private helper: Find credential index by SSID
-uint8_t AutoNetworkCredential::_findBySSID(const char *ssid)
+uint8_t AutoNetworkCredential::_findBySSID(const char* ssid)
 {
     for (uint8_t i = 0; i < _credentials.size(); i++)
     {

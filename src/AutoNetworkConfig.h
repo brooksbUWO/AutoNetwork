@@ -19,6 +19,7 @@
 
 #include "Arduino.h"
 #include "AutoNetworkLog.h"
+#include "esp_mac.h"
 
 // Credential Save Mode Enumeration
 // ****************************************************************************
@@ -84,9 +85,10 @@ public:
      * @details SSID broadcasted when captive portal is active. Users connect to this
      *          network to access the WiFi configuration interface.
      *
-     * @note Default: "AutoNetwork"
+     * @note Default: "ESP32_{MAC_ADDRESS}" (generated from device MAC address in constructor)
+     * @note Fallback: "ESP32_AP_ERROR" if MAC read fails (hardware fault)
      */
-    String apSSID = "AutoNetwork";
+    String apSSID = "AutoNetwork";  // Overwritten in constructor
 
     /**
      * @brief Access Point password for captive portal.
@@ -284,6 +286,25 @@ public:
      */
     AutoNetworkConfig()
     {
-        // All defaults already set in member initializers above
+        // Generate unique MAC-based default SSID
+        uint8_t mac[6];
+        esp_err_t err = esp_efuse_mac_get_default(mac);
+        
+        if (err == ESP_OK)
+        {
+            // Convert MAC bytes to hex string (12 characters, uppercase, no colons)
+            // Format: ESP32_AABBCCDDEEFF
+            char macStr[13];  // 12 hex chars + null terminator
+            snprintf(macStr, sizeof(macStr), "%02X%02X%02X%02X%02X%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            apSSID = "ESP32_" + String(macStr);
+        }
+        else
+        {
+            // eFuse MAC read failed - use error SSID for debugging
+            apSSID = "ESP32_AP_ERROR";
+        }
+        
+        // All other defaults already set in member initializers above
     }
 };

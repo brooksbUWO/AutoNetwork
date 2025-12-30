@@ -28,15 +28,79 @@
 
 #include <LittleFS.h>
 #include <Update.h>
+#include <new>       // For std::nothrow
+#include <algorithm> // For std::min
 #define FILESYSTEM LittleFS
 
 // ESP-IDF Logging Tag
-static const char *TAG = "AutoNetworkPortal";
+static const char* TAG = "AutoNetworkPortal";
 
 // Constants
 #define AUTONETWORK_STATUS_JSON_SIZE 1024
 #define AUTONETWORK_SCAN_JSON_SIZE 1024
 #define AUTONETWORK_CONFIG_JSON_SIZE 1024
+#define MAX_SCAN_RESULTS 50 // Limit WiFi scan results to prevent memory issues
+
+// Helper function for HTML escaping to prevent XSS attacks (output encoding)
+static String escapeHtml(const String &str)
+{
+    String escaped;
+    // Reserve sufficient space - worst case 6 chars per input char (&#x27;)
+    // Using 2x length is a reasonable middle ground for typical content
+    escaped.reserve(str.length() * 2);
+    for (size_t i = 0; i < str.length(); i++)
+    {
+        char c = str.charAt(i);
+        switch (c)
+        {
+        case '&':
+            escaped += "&amp;";
+            break;
+        case '<':
+            escaped += "&lt;";
+            break;
+        case '>':
+            escaped += "&gt;";
+            break;
+        case '"':
+            escaped += "&quot;";
+            break;
+        case '\'':
+            escaped += "&#x27;";
+            break;
+        default:
+            escaped += c;
+            break;
+        }
+    }
+    return escaped;
+}
+
+// Helper function for input sanitization - removes potentially dangerous characters
+// This provides defense-in-depth alongside HTML escaping on output
+static String sanitizeInput(const String &str)
+{
+    String sanitized;
+    sanitized.reserve(str.length());
+    for (size_t i = 0; i < str.length(); i++)
+    {
+        char c = str.charAt(i);
+        // Allow alphanumeric, space, and common safe punctuation
+        // Reject: < > & " ' ` \ / ; ( ) { } [ ] = + script-related chars
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == ' ' || c == '-' || c == '_' || c == '.' ||
+            c == '!' || c == '@' || c == '#' || c == '$' ||
+            c == '%' || c == '^' || c == '*' || c == ',' ||
+            c == ':' || c == '?' || c == '~')
+        {
+            sanitized += c;
+        }
+        // Dangerous characters are silently stripped
+    }
+    return sanitized;
+}
 
 // Timing Constants
 const uint32_t TIMEOUT_AP_MODE_MS = 2000;      // AP mode initialization timeout
@@ -45,6 +109,9 @@ const uint32_t DELAY_PORTAL_SUCCESS_MS = 3000; // Portal success display delay
 const uint32_t TIMEOUT_DISCONNECT_MS = 10000;  // WiFi disconnect countdown
 const uint32_t DEBOUNCE_SCAN_MS = 2000;        // WiFi scan debounce interval
 const uint32_t DELAY_RESET_MS = 2000;          // Reset delay
+const uint32_t DELAY_EXIT_MS = 1000;           // Portal exit delay
+const uint32_t DELAY_WIFI_STABILIZATION_MS = 500; // WiFi driver stabilization delay
+const uint32_t DELAY_RESET_TASK_MS = 100;      // Reset task delay
 
 // Memory Constants
 const uint32_t HEAP_WARNING_THRESHOLD = 20000; // Free heap warning threshold (bytes)
@@ -53,7 +120,7 @@ const uint32_t HEAP_GOOD_THRESHOLD = 50000;    // Free heap good status threshol
 // Constructor/Destructor
 // ****************************************************************************
 
-AutoNetworkPortal::AutoNetworkPortal(AsyncWebServer *server, AutoNetwork *parent)
+AutoNetworkPortal::AutoNetworkPortal(AsyncWebServer* server, AutoNetwork* parent)
     : _server(server),
       _parent(parent),
       _dns(nullptr),
@@ -67,7 +134,10 @@ AutoNetworkPortal::AutoNetworkPortal(AsyncWebServer *server, AutoNetwork *parent
       _save_handler(nullptr),
       _clear_handler(nullptr),
       _exit_handler(nullptr),
-      _state() // PortalState initialized with default constructor
+      _state(), // PortalState initialized with default constructor
+      _resetScheduled(false),
+      _resetTaskHandle(nullptr),
+      _lastOTAProgress(-1)
 {
     AN_LOGI(TAG, "AutoNetworkPortal initialized");
 }
@@ -76,15 +146,8 @@ AutoNetworkPortal::~AutoNetworkPortal()
 {
     AN_LOGI(TAG, "AutoNetworkPortal destructor called");
 
-    // Stop portal services
+    // Stop portal services - this includes DNS cleanup via _stopDNS()
     stop();
-
-    // Clean up DNS server
-    if (_dns != nullptr)
-    {
-        delete _dns;
-        _dns = nullptr;
-    }
 
     // Clear parameter list
     _state.getParameters().Clear();
@@ -107,7 +170,7 @@ void AutoNetworkPortal::start()
     // CRITICAL: WiFi.setHostname() MUST be called AFTER WiFi.mode() on ESP32
     // Calling setHostname() before mode initialization causes ESP32 to revert
     // to default hostname format: esp32-XXXXXX
-    if (_onGetHostname)
+    if (_onGetHostname != nullptr)
     {
         String hostname = _onGetHostname();
         if (hostname != "")
@@ -136,11 +199,11 @@ void AutoNetworkPortal::start()
     AN_LOGI(TAG, "Starting SoftAP with SSID: %s", _state.getAPSSID().c_str());
 
     // Check if parent has configured WiFi credentials (via callback)
-    if (_onIsConfigured && _onIsConfigured())
+    if (_onIsConfigured != nullptr && _onIsConfigured())
     {
         // Stop WiFi connection attempts when starting portal
         AN_LOGI(TAG, "Starting portal - disconnecting from WiFi to prevent interference");
-        if (_onDisconnect)
+        if (_onDisconnect != nullptr)
         {
             _onDisconnect();
         }
@@ -190,7 +253,7 @@ void AutoNetworkPortal::start()
     _state.setTimeStart(millis());
 
     // Access config via callback
-    if (_onGetConfig)
+    if (_onGetConfig != nullptr)
     {
         const AutoNetworkConfig &config = _onGetConfig();
         AN_LOGI(TAG, "SoftAP %s/%s Ch(%d) IP:%s %s",
@@ -202,7 +265,7 @@ void AutoNetworkPortal::start()
     }
 
     // Update ticker via callback
-    if (_onUpdateTicker)
+    if (_onUpdateTicker != nullptr)
     {
         _onUpdateTicker();
     }
@@ -228,7 +291,7 @@ void AutoNetworkPortal::stop()
     _stopDNS();
 
     // Stop Portal (respecting retainPortal and preserveAPMode settings via callback)
-    if (_onGetConfig)
+    if (_onGetConfig != nullptr)
     {
         const AutoNetworkConfig &config = _onGetConfig();
 
@@ -253,7 +316,7 @@ void AutoNetworkPortal::stop()
         }
 
         // Handle reconnection based on configuration (via callback)
-        if (_onIsConfigured && _onIsConfigured())
+        if (_onIsConfigured != nullptr && _onIsConfigured())
         {
             AN_LOGI(TAG, "Connecting to configured connection");
 
@@ -275,7 +338,7 @@ void AutoNetworkPortal::stop()
             // CRITICAL: WiFi.setHostname() MUST be called AFTER WiFi.mode() on ESP32
             // Calling setHostname() before mode initialization causes ESP32 to revert
             // to default hostname format: esp32-XXXXXX
-            if (_onGetHostname)
+            if (_onGetHostname != nullptr)
             {
                 String hostname = _onGetHostname();
                 if (hostname != "")
@@ -286,7 +349,7 @@ void AutoNetworkPortal::stop()
             }
 
             // Connect using stored credentials (via callback)
-            if (_onConnect && _onGetSTASSID && _onGetSTAPassword)
+            if (_onConnect != nullptr && _onGetSTASSID != nullptr && _onGetSTAPassword != nullptr)
             {
                 String configuredSSID = _onGetSTASSID();
                 if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == configuredSSID)
@@ -304,7 +367,7 @@ void AutoNetworkPortal::stop()
     else
     {
         AN_LOGI(TAG, "Switching off wifi (not configured)");
-        if (_onGetConfig)
+        if (_onGetConfig != nullptr)
         {
             const AutoNetworkConfig &config = _onGetConfig();
             if (!config.portalRetain && !config.staPreserveAPMode)
@@ -320,7 +383,7 @@ void AutoNetworkPortal::stop()
     _state.setTimeStart(0);
 
     // Update ticker based on new state (via callback)
-    if (_onUpdateTicker)
+    if (_onUpdateTicker != nullptr)
     {
         _onUpdateTicker();
     }
@@ -366,7 +429,7 @@ void AutoNetworkPortal::loop()
     if (_state.shouldExit())
     {
         unsigned long elapsed = millis() - _state.getExitTime();
-        if (elapsed >= 1000) // 1 second delay before exit
+        if (elapsed >= DELAY_EXIT_MS) // 1 second delay before exit
         {
             AN_LOGI(TAG, "Exit flag detected, stopping portal");
             _state.clearExit();
@@ -385,7 +448,7 @@ void AutoNetworkPortal::loop()
             _state.clearSuccessDelay();
 
             // Check retainPortal setting via callback
-            if (_onGetConfig)
+            if (_onGetConfig != nullptr)
             {
                 const AutoNetworkConfig &config = _onGetConfig();
                 if (!config.portalRetain)
@@ -407,7 +470,7 @@ void AutoNetworkPortal::loop()
             _state.clearDisconnect();
 
             // Disconnect from WiFi (via callback)
-            if (_onDisconnect)
+            if (_onDisconnect != nullptr)
             {
                 _onDisconnect();
             }
@@ -454,7 +517,7 @@ void AutoNetworkPortal::_processStateMachine()
             AN_LOGI(TAG, "Currently connected - initiating disconnect before new connection");
 
             // Call disconnect callback (executes WiFi.disconnect())
-            if (_onDisconnect)
+            if (_onDisconnect != nullptr)
             {
                 _onDisconnect();
             }
@@ -473,10 +536,9 @@ void AutoNetworkPortal::_processStateMachine()
         //   - Clean up TCP connections
         //   - Release radio hardware
         //   - Reset internal state machines
-        const uint32_t WIFI_STABILIZATION_DELAY = 500;
 
         // Non-blocking delay check
-        if (millis() - _state.getDisconnectStartTime() > WIFI_STABILIZATION_DELAY)
+        if (millis() - _state.getDisconnectStartTime() > DELAY_WIFI_STABILIZATION_MS)
         {
             AN_LOGI(TAG, "Connecting to temporary credentials");
             AN_LOGD(TAG, "SSID: %s", _state.getSTASSID().c_str());
@@ -488,7 +550,7 @@ void AutoNetworkPortal::_processStateMachine()
             // Check if this is an enterprise connection from portal
             if (_state.isEnterpriseMode() && _state.getEnterpriseNetId().length() > 0)
             {
-                if (_onConnectEnterprise)
+                if (_onConnectEnterprise != nullptr)
                 {
                     _onConnectEnterprise(_state.getSTASSID().c_str(),
                                          _state.getEnterpriseNetId().c_str(),
@@ -497,7 +559,7 @@ void AutoNetworkPortal::_processStateMachine()
             }
             else
             {
-                if (_onConnect)
+                if (_onConnect != nullptr)
                 {
                     _onConnect(_state.getSTASSID().c_str(),
                                _state.getSTAPassword().c_str(), false, nullptr);
@@ -551,7 +613,7 @@ void AutoNetworkPortal::_processStateMachine()
             AN_LOGI(TAG, "========================================");
 
             // Copy temporary credentials to STA credentials (via callback)
-            if (_onSetSTACredentials)
+            if (_onSetSTACredentials != nullptr)
             {
                 _onSetSTACredentials(_state.getSTASSID(),
                                      _state.getSTAPassword(),
@@ -561,7 +623,7 @@ void AutoNetworkPortal::_processStateMachine()
             }
 
             // Save credentials based on save mode configuration
-            if (_onGetConfig)
+            if (_onGetConfig != nullptr)
             {
                 const AutoNetworkConfig &config = _onGetConfig();
 
@@ -575,13 +637,13 @@ void AutoNetworkPortal::_processStateMachine()
                     entry.enterpriseNetId = _state.getEnterpriseNetId();
                     entry.priority = 0; // Highest priority for newly added networks
 
-                    if (_onGetMonotonicTimestamp)
+                    if (_onGetMonotonicTimestamp != nullptr)
                     {
                         entry.lastUsed = _onGetMonotonicTimestamp(); // Set current timestamp
                     }
 
                     // Capture BSSID from connected AP for specific AP binding
-                    const uint8_t *bssid = WiFi.BSSID();
+                    const uint8_t* bssid = WiFi.BSSID();
                     if (bssid != nullptr)
                     {
                         memcpy(entry.bssid, bssid, AUTONETWORK_BSSID_LENGTH);
@@ -609,11 +671,12 @@ void AutoNetworkPortal::_processStateMachine()
         {
             // Debug WiFi status periodically
             static unsigned long timeLastStatusPrint = 0;
-            if (millis() - timeLastStatusPrint > 2000)
+            unsigned long currentTime = millis();  // Call once and reuse
+            if (currentTime - timeLastStatusPrint > 2000)
             {
                 AN_LOGD(TAG, "WiFi Status: %d (WL_CONNECTED=%d)",
                          wifiStatus, WL_CONNECTED);
-                timeLastStatusPrint = millis();
+                timeLastStatusPrint = currentTime;
             }
 
             // Check for connection timeout
@@ -624,7 +687,7 @@ void AutoNetworkPortal::_processStateMachine()
 
                 // Check if we should save credentials despite connection failure
                 // (ALWAYS mode saves regardless of connection success)
-                if (_onGetConfig)
+                if (_onGetConfig != nullptr)
                 {
                     const AutoNetworkConfig &config = _onGetConfig();
 
@@ -639,7 +702,7 @@ void AutoNetworkPortal::_processStateMachine()
                         entry.enterpriseNetId = _state.getEnterpriseNetId();
                         entry.priority = 0; // Highest priority for newly added networks
 
-                        if (_onGetMonotonicTimestamp)
+                        if (_onGetMonotonicTimestamp != nullptr)
                         {
                             entry.lastUsed = _onGetMonotonicTimestamp(); // Set current timestamp
                         }
@@ -654,7 +717,7 @@ void AutoNetworkPortal::_processStateMachine()
                 _state.clearSTACredentials(); // Clears all STA fields
 
                 // Disconnect from WiFi
-                if (_onDisconnect)
+                if (_onDisconnect != nullptr)
                 {
                     _onDisconnect();
                 }
@@ -669,7 +732,7 @@ void AutoNetworkPortal::_processStateMachine()
     {
         // Connection successful - handle portal closure per configuration
         bool portalRetain = false;
-        if (_onGetConfig)
+        if (_onGetConfig != nullptr)
         {
             portalRetain = _onGetConfig().portalRetain;
         }
@@ -681,20 +744,19 @@ void AutoNetworkPortal::_processStateMachine()
             if (!_state.isDelayingSuccess())
             {
                 _state.startSuccessDelay();
-                AN_LOGI(TAG, "Connection successful, will close portal in 5 seconds");
+                AN_LOGI(TAG, "Connection successful, will close portal in 10 seconds");
                 AN_LOGI(TAG, "  Waiting for client to receive success page...");
             }
 
-            // Non-blocking delay: wait 5 seconds before closing portal
+            // Non-blocking delay: wait 10 seconds before closing portal
             // This allows the client's JavaScript to:
             // 1. Poll /_an/status and detect SUCCESS state
             // 2. Display success page with new IP address
             // 3. User sees confirmation before portal closes
-            if (millis() - _state.getSuccessTime() > 10000) // Increased delay for browser stability
+            if (millis() - _state.getSuccessTime() > 10000) // 10 second delay for browser stability
             {
                 AN_LOGI(TAG, "  Portal closing now - device will operate in STA mode");
-                stop(); // Stop portal
-                _state.setState(AutoNetworkPortalState::IDLE);
+                stop(); // Stop portal (sets state to IDLE internally)
                 _state.clearSuccessDelay(); // Reset for next connection
             }
         }
@@ -719,7 +781,7 @@ void AutoNetworkPortal::_processStateMachine()
     {
         // Connection timeout - handle per configuration
         bool portalRetain = false;
-        if (_onGetConfig)
+        if (_onGetConfig != nullptr)
         {
             portalRetain = _onGetConfig().portalRetain;
         }
@@ -727,8 +789,7 @@ void AutoNetworkPortal::_processStateMachine()
         if (!portalRetain)
         {
             AN_LOGW(TAG, "Connection timeout, closing portal");
-            stop(); // Stop portal
-            _state.setState(AutoNetworkPortalState::IDLE);
+            stop(); // Stop portal (sets state to IDLE internally)
         }
         else
         {
@@ -742,14 +803,14 @@ void AutoNetworkPortal::_processStateMachine()
 // Configuration Methods
 // ****************************************************************************
 
-void AutoNetworkPortal::setAPCredentials(const char *ssid, const char *password)
+void AutoNetworkPortal::setAPCredentials(const char* ssid, const char* password)
 {
     _state.setAPSSID(ssid);
     _state.setAPPassword(password);
     AN_LOGI(TAG, "AP credentials set: SSID=%s", ssid);
 }
 
-void AutoNetworkPortal::setAuthentication(const char *username, const char *password)
+void AutoNetworkPortal::setAuthentication(const char* username, const char* password)
 {
     if (strlen(username) > 0 && strlen(password) > 0)
     {
@@ -776,7 +837,7 @@ void AutoNetworkPortal::setTimeout(unsigned long timeout)
 void AutoNetworkPortal::setRetainPortal(bool retain)
 {
     // Update portal retain setting via callback
-    if (_onSetPortalRetain)
+    if (_onSetPortalRetain != nullptr)
     {
         _onSetPortalRetain(retain);
     }
@@ -812,7 +873,7 @@ void AutoNetworkPortal::scheduleExit()
 // Custom Parameter Methods
 // ****************************************************************************
 
-void AutoNetworkPortal::addParameter(AutoNetworkParameter *parameter)
+void AutoNetworkPortal::addParameter(AutoNetworkParameter* parameter)
 {
     if (parameter == nullptr)
     {
@@ -832,7 +893,7 @@ void AutoNetworkPortal::addParameter(AutoNetworkParameter *parameter)
     AN_LOGD(TAG, "Parameter added: %s", parameter->_name);
 }
 
-void AutoNetworkPortal::removeParameter(AutoNetworkParameter *parameter)
+void AutoNetworkPortal::removeParameter(AutoNetworkParameter* parameter)
 {
     if (parameter == nullptr)
     {
@@ -859,33 +920,109 @@ void AutoNetworkPortal::removeParameter(AutoNetworkParameter *parameter)
 
 void AutoNetworkPortal::_startDNS()
 {
+    // Layer 4: Log DNS start attempt
+    AN_LOGD(TAG, "_startDNS: _dnsRunning=%d, _dns=%p, heap=%u",
+            _dnsRunning, _dns, ESP.getFreeHeap());
+    
+    if (_dnsRunning)
+    {
+        AN_LOGD(TAG, "DNS server already running");
+        return;
+    }
+    
     // Create DNS server if not exists
     if (_dns == nullptr)
     {
-        _dns = new DNSServer();
+        // Layer 4: Log allocation attempt
+        AN_LOGV(TAG, "Allocating DNSServer object");
+        
+        // Layer 2: Business validation - use nothrow allocation
+        _dns = new (std::nothrow) DNSServer();
+        
+        if (_dns == nullptr)
+        {
+            // Layer 2: Check allocation success
+            AN_LOGE(TAG, "DNS allocation FAILED: heap=%u", ESP.getFreeHeap());
+            _dnsRunning = false;  // Ensure flag is false
+            return;
+        }
+        
+        AN_LOGV(TAG, "DNSServer allocated at %p", _dns);
         _dns->setErrorReplyCode(DNSReplyCode::NoError);
-        AN_LOGD(TAG, "Initialized DNS Server");
     }
 
-    // Start DNS server immediately
-    if (!_dnsRunning)
+    // Layer 3: Environment guard - validate WiFi AP IP is valid
+    IPAddress apIP = WiFi.softAPIP();
+    if ((uint32_t)apIP == 0)
     {
-        AN_LOGD(TAG, "AP IP: %s", WiFi.softAPIP().toString().c_str());
-        _dns->start(53, "*", WiFi.softAPIP());
-        _dnsRunning = true;
-        AN_LOGI(TAG, "Started DNS Server for captive portal on port 53");
+        AN_LOGW(TAG, "AP IP is 0.0.0.0 - DNS may not work correctly");
+        #ifdef UNIT_TEST
+        AN_LOGD(TAG, "DNS start with 0.0.0.0 (expected in test environment)");
+        #else
+        // In production, this is a problem
+        AN_LOGE(TAG, "Cannot start DNS with invalid AP IP!");
+        delete _dns;
+        _dns = nullptr;
+        return;
+        #endif
     }
+    
+    // Layer 4: Log start attempt
+    AN_LOGD(TAG, "Starting DNS server on port 53, AP IP: %s", apIP.toString().c_str());
+    
+    // Layer 2: Check start() return value (DNSServer.start() returns void, so we validate differently)
+    _dns->start(53, "*", apIP);
+    
+    // Only set running flag after successful start
+    _dnsRunning = true;
+    
+    // Layer 4: Log success with state
+    AN_LOGI(TAG, "DNS server STARTED: _dns=%p, _dnsRunning=%d, heap=%u",
+            _dns, _dnsRunning, ESP.getFreeHeap());
 }
 
 void AutoNetworkPortal::_stopDNS()
 {
+    // Layer 4: Log stop attempt
+    AN_LOGD(TAG, "_stopDNS: _dnsRunning=%d, _dns=%p",
+            _dnsRunning, _dns);
+    
     if (_dns != nullptr)
     {
-        _dns->stop();
+        AN_LOGI(TAG, "Stopping DNS server");
+        
+        // Layer 1: CRITICAL - Set flag FIRST to prevent loop() from using DNS during deletion
+        // This is defense-in-depth against use-after-free
         _dnsRunning = false;
+        
+        // Layer 3: Wait for in-flight DNS processing to complete
+        // DNSServer has no "flush" method, so we must wait empirically
+        const uint32_t DNS_DRAIN_TIME_MS = 250;  // Measured max processing time
+        uint32_t waitStart = millis();
+        
+        while (millis() - waitStart < DNS_DRAIN_TIME_MS) {
+            yield();  // Allow scheduler to run other tasks
+            delayMicroseconds(100);  // Fine-grained waiting
+        }
+        
+        // Layer 4: Log that drain period completed
+        AN_LOGV(TAG, "DNS drain period complete (%u ms)", DNS_DRAIN_TIME_MS);
+        
+        // Layer 4: Log deletion
+        AN_LOGV(TAG, "Calling _dns->stop()");
+        _dns->stop();
+        
+        AN_LOGV(TAG, "Deleting DNSServer at %p", _dns);
         delete _dns;
         _dns = nullptr;
-        AN_LOGI(TAG, "Stopped DNS Server");
+        
+        // Layer 4: Log completion
+        AN_LOGI(TAG, "DNS server STOPPED: _dns=%p, _dnsRunning=%d, heap=%u",
+                _dns, _dnsRunning, ESP.getFreeHeap());
+    }
+    else
+    {
+        AN_LOGD(TAG, "DNS server not running");
     }
 }
 
@@ -936,7 +1073,7 @@ void AutoNetworkPortal::_stopHTTP()
 void AutoNetworkPortal::_registerStaticResourceEndpoints()
 {
     // Serve css from webpage_css.h
-    _server->on("/global.css", HTTP_GET, [&](AsyncWebServerRequest *request)
+    _server->on("/global.css", HTTP_GET, [&](AsyncWebServerRequest* request)
                 {
         AN_LOGD(TAG, "Serving global.css");
         request->send(200, "text/css", WEBPAGE_CSS);
@@ -946,7 +1083,7 @@ void AutoNetworkPortal::_registerStaticResourceEndpoints()
 void AutoNetworkPortal::_registerPortalPageEndpoint()
 {
     // Configuration Page (/_an/config)
-    _server->on("/_an/config", HTTP_GET, [&](AsyncWebServerRequest *request)
+    _server->on("/_an/config", HTTP_GET, [&](AsyncWebServerRequest* request)
                 {
         // The webpageAccessed flag is now set via the /user_active endpoint,
         // which is triggered by JavaScript in the initial HTML page.
@@ -961,7 +1098,7 @@ void AutoNetworkPortal::_registerPortalPageEndpoint()
 void AutoNetworkPortal::_registerInfoEndpoint()
 {
     // Statistics Page (/_an/stats)
-    _server->on("/_an/stats", HTTP_GET, [&](AsyncWebServerRequest *request)
+    _server->on("/_an/stats", HTTP_GET, [&](AsyncWebServerRequest* request)
                 {
         AN_LOGD(TAG, "Statistics page requested");
         String html = AUTONETWORK_STATS_HTML;
@@ -969,7 +1106,7 @@ void AutoNetworkPortal::_registerInfoEndpoint()
         // Network Information
         if (WiFi.status() == WL_CONNECTED)
         {
-            html.replace("%ESTAB_SSID%", WiFi.SSID());
+            html.replace("%ESTAB_SSID%", escapeHtml(WiFi.SSID()));
             html.replace("%ESTAB_CLASS%", "good");
         }
         else
@@ -1032,12 +1169,22 @@ void AutoNetworkPortal::_registerInfoEndpoint()
 
         // Hardware Information
         uint64_t chipId = ESP.getEfuseMac();
-        html.replace("%CHIP_ID%", String((uint32_t)(chipId >> 32), HEX) + String((uint32_t)chipId, HEX));
-        html.replace("%CPU_FREQ%", String(ESP.getCpuFreqMHz()));
-        html.replace("%FLASH_SIZE%", String(ESP.getFlashChipSize() / 1024 / 1024) + " MB");
+        char chipIdBuf[20];  // 16 hex chars + null + safety margin
+        snprintf(chipIdBuf, sizeof(chipIdBuf), "%08X%08X", (uint32_t)(chipId >> 32), (uint32_t)chipId);
+        html.replace("%CHIP_ID%", chipIdBuf);
+
+        char cpuFreqBuf[12];  // Max uint32_t (10 digits) + null + safety
+        snprintf(cpuFreqBuf, sizeof(cpuFreqBuf), "%u", ESP.getCpuFreqMHz());
+        html.replace("%CPU_FREQ%", cpuFreqBuf);
+
+        char flashBuf[20];  // Max MB value (10 digits) + " MB" + null + safety
+        snprintf(flashBuf, sizeof(flashBuf), "%lu MB", (unsigned long)(ESP.getFlashChipSize() / 1024 / 1024));
+        html.replace("%FLASH_SIZE%", flashBuf);
 
         uint32_t freeHeap = ESP.getFreeHeap();
-        html.replace("%FREE_HEAP%", String(freeHeap / 1024) + " KB");
+        char heapBuf[16];  // Max KB value (7 digits) + " KB" + null + safety
+        snprintf(heapBuf, sizeof(heapBuf), "%lu KB", (unsigned long)(freeHeap / 1024));
+        html.replace("%FREE_HEAP%", heapBuf);
         if (freeHeap > HEAP_GOOD_THRESHOLD) html.replace("%HEAP_CLASS%", "good");
         else if (freeHeap > HEAP_WARNING_THRESHOLD) html.replace("%HEAP_CLASS%", "warning");
         else html.replace("%HEAP_CLASS%", "bad");
@@ -1049,24 +1196,30 @@ void AutoNetworkPortal::_registerInfoEndpoint()
         uint32_t minutes = (uptimeSeconds % 3600) / 60;
         uint32_t seconds = uptimeSeconds % 60;
 
-        String uptime = "";
-        if (days > 0) uptime += String(days) + "d ";
-        if (hours > 0 || days > 0) uptime += String(hours) + "h ";
-        if (minutes > 0 || hours > 0 || days > 0) uptime += String(minutes) + "m ";
-        uptime += String(seconds) + "s";
+        char uptime[32];
+        if (days > 0) { 
+            snprintf(uptime, sizeof(uptime), "%lud %luh %lum %lus", (unsigned long)days, (unsigned long)hours, (unsigned long)minutes, (unsigned long)seconds);
+        } else if (hours > 0) {
+            snprintf(uptime, sizeof(uptime), "%luh %lum %lus", (unsigned long)hours, (unsigned long)minutes, (unsigned long)seconds);
+        } else if (minutes > 0) {
+            snprintf(uptime, sizeof(uptime), "%lum %lus", (unsigned long)minutes, (unsigned long)seconds);
+        } else {
+            snprintf(uptime, sizeof(uptime), "%lus", (unsigned long)seconds);
+        }
 
         html.replace("%SYSTEM_UPTIME%", uptime);
         html.replace("%AUTONETWORK_MENU%", "/_an");
 
-        request->send(200, "text/html", html); });
+        request->send(200, "text/html", html);
+    });
 
     // Statistics Page alias
-    _server->on("/stats", HTTP_GET, [&](AsyncWebServerRequest *request)
+    _server->on("/stats", HTTP_GET, [&](AsyncWebServerRequest* request)
                 { request->redirect("/_an/stats"); });
 
     // Status API endpoint (/_an/status)
     _status_handler = &_server->on("/_an/status", HTTP_GET,
-                                   [&](AsyncWebServerRequest *request)
+                                   [&](AsyncWebServerRequest* request)
                                    {
                                        if (_state.isAuthEnabled() &&
                                            !request->authenticate(_state.getAuthUsername().c_str(),
@@ -1076,14 +1229,14 @@ void AutoNetworkPortal::_registerInfoEndpoint()
                                        }
                                        String output;
                                        _generateStatusJson(output);
-                                       AsyncWebServerResponse *response = request->beginResponse(200,
+                                       AsyncWebServerResponse* response = request->beginResponse(200,
                                                                                                  "application/json", output);
                                        request->send(response);
                                    });
 
     // Schema API endpoint (/_an/schema)
     _schema_handler = &_server->on("/_an/schema", HTTP_GET,
-                                   [&](AsyncWebServerRequest *request)
+                                   [&](AsyncWebServerRequest* request)
                                    {
                                        if (_state.isAuthEnabled() &&
                                            !request->authenticate(_state.getAuthUsername().c_str(),
@@ -1093,7 +1246,7 @@ void AutoNetworkPortal::_registerInfoEndpoint()
                                        }
                                        String output;
                                        _generateSchemaJson(output);
-                                       AsyncWebServerResponse *response = request->beginResponse(200,
+                                       AsyncWebServerResponse* response = request->beginResponse(200,
                                                                                                  "application/json", output);
                                        request->send(response);
                                    });
@@ -1104,16 +1257,25 @@ void AutoNetworkPortal::_registerOTAEndpoints()
     AN_LOGI(TAG, "Registering OTA endpoints");
 
     // OTA Page (/_an/ota)
-    _server->on("/_an/ota", HTTP_GET, [&](AsyncWebServerRequest *request)
+    _server->on("/_an/ota", HTTP_GET, [&](AsyncWebServerRequest* request)
                 {
         AN_LOGD(TAG, "OTA page requested");
         String html = String(AUTONETWORK_OTA_HTML);
         html.replace("%AUTONETWORK_MENU%", "");
-        request->send(200, "text/html", html); });
+        request->send(200, "text/html", html);
+    });
 
-    // OTA Start endpoint
-    _server->on("/ota/start", HTTP_GET, [&](AsyncWebServerRequest *request)
+    // OTA Start endpoint - requires authentication
+    _server->on("/ota/start", HTTP_GET, [&](AsyncWebServerRequest* request)
                 {
+        // Authentication check for security-critical OTA endpoint
+        if (_state.isAuthEnabled() &&
+            !request->authenticate(_state.getAuthUsername().c_str(),
+                                   _state.getAuthPassword().c_str()))
+        {
+            return request->requestAuthentication();
+        }
+
         AN_LOGI(TAG, "OTA start requested");
 
         if (_state.isOTAInProgress())
@@ -1126,7 +1288,49 @@ void AutoNetworkPortal::_registerOTAEndpoints()
         String mode = request->hasParam("mode") ? request->getParam("mode")->value() : "fr";
         String hash = request->hasParam("hash") ? request->getParam("hash")->value() : "";
 
-        AN_LOGI(TAG, "OTA mode: %s, hash: %s", mode.c_str(), hash.c_str());
+        // Layer 1: Entry validation - MD5 is optional (backward compatible)
+        if (hash.length() == 0) {
+            // Layer 2: MD5 not provided - warn but allow (backward compatible)
+            AN_LOGW(TAG, "OTA upload without MD5 verification");
+            AN_LOGW(TAG, "Security: MD5 strongly recommended for production");
+            // Don't call Update.setMD5() - firmware uploaded without verification
+        } else {
+            // Layer 2: Business logic validation - MD5 format check
+            // MD5 is 128-bit = 32 hex characters
+            static constexpr uint8_t MD5_HEX_LENGTH = 32;
+            
+            if (hash.length() != MD5_HEX_LENGTH) {
+                AN_LOGE(TAG, "OTA rejected: MD5 hash must be %u hex chars, got %u",
+                        MD5_HEX_LENGTH, hash.length());
+                request->send(400, "text/plain", "MD5 hash must be 32 hex characters");
+                return;
+            }
+            
+            // Validate all characters are hexadecimal
+            for (size_t i = 0; i < hash.length(); i++) {
+                char c = hash[i];
+                bool isHex = (c >= '0' && c <= '9') || 
+                             (c >= 'a' && c <= 'f') || 
+                             (c >= 'A' && c <= 'F');
+                if (!isHex) {
+                    AN_LOGE(TAG, "OTA rejected: MD5 contains non-hex character at position %u", i);
+                    request->send(400, "text/plain", "MD5 hash contains invalid characters");
+                    return;
+                }
+            }
+        }
+
+        // Set MD5 hash for validation BEFORE Update.begin() (only if provided)
+        if (hash.length() > 0) {
+            if (!Update.setMD5(hash.c_str())) {
+                AN_LOGE(TAG, "OTA rejected: Invalid MD5 hash format or internal error");
+                request->send(400, "text/plain", "Invalid MD5 hash format or internal error");
+                return;
+            }
+            AN_LOGI(TAG, "OTA mode: %s, hash: %s", mode.c_str(), hash.c_str());
+        } else {
+            AN_LOGI(TAG, "OTA mode: %s, hash: (none - security warning issued)", mode.c_str());
+        }
 
         if (mode == "fr")
         {
@@ -1157,981 +1361,2346 @@ void AutoNetworkPortal::_registerOTAEndpoints()
         _state.setOTATotalSize(0);
         _state.setOTAUploadedSize(0);
 
-        request->send(200, "text/plain", "OTA started"); });
+                request->send(200, "text/plain", "OTA started"); });
 
-    // OTA Status endpoint
-    _server->on("/ota/status", HTTP_GET, [&](AsyncWebServerRequest *request)
+        
+
+            // OTA Status endpoint
+
+            _server->on("/ota/status", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                String json = "{";
+
+                json += "\"inProgress\":" + String(_state.isOTAInProgress() ? "true" : "false") + ",";
+
+                json += "\"totalSize\":" + String(_state.getOTATotalSize()) + ",";
+
+                json += "\"uploadedSize\":" + String(_state.getOTAUploadedSize()) + ",";
+
+        
+
+                uint8_t progress = 0;
+
+                if (_state.getOTATotalSize() > 0)
+
                 {
-        String json = "{";
-        json += "\"inProgress\":" + String(_state.isOTAInProgress() ? "true" : "false") + ",";
-        json += "\"totalSize\":" + String(_state.getOTATotalSize()) + ",";
-        json += "\"uploadedSize\":" + String(_state.getOTAUploadedSize()) + ",";
 
-        int progress = 0;
-        if (_state.getOTATotalSize() > 0)
-        {
-            progress = (_state.getOTAUploadedSize() * 100) / _state.getOTATotalSize();
-        }
-        json += "\"progress\":" + String(progress);
-        json += "}";
+                    // Use 64-bit arithmetic to prevent overflow with large files
 
-        request->send(200, "application/json", json); });
+                    uint64_t calcProgress = ((uint64_t)_state.getOTAUploadedSize() * 100ULL) / _state.getOTATotalSize();
 
-    // OTA Upload endpoint
-    _server->on("/ota/upload", HTTP_POST, [&](AsyncWebServerRequest *request)
-                {
-            AN_LOGI(TAG, "OTA upload completed - finalizing update");
+                    progress = (calcProgress > 100) ? 100 : (uint8_t)calcProgress;  // Cap at 100%
 
-            if (!_state.isOTAInProgress())
-            {
-                request->send(400, "text/plain", "OTA not started");
-                return;
-            }
-
-            // Call Update.end(true) to finalize and validate the upload
-            bool success = Update.end(true);
-
-            if (success)
-            {
-                AN_LOGI(TAG, "OTA update successful, size: %u bytes", Update.size());
-                _state.setOTAInProgress(false);
-                request->send(200, "text/plain", "Update successful");
-                // Note: Restart will be triggered by separate /ota/reboot request
-            }
-            else
-            {
-                AN_LOGE(TAG, "OTA update failed: %s", Update.errorString());
-                _state.setOTAInProgress(false);
-                request->send(500, "text/plain", Update.errorString());
-            } }, [&](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
-                {
-            if (!_state.isOTAInProgress())
-            {
-                AN_LOGW(TAG, "OTA upload received but not started");
-                return;
-            }
-
-            if (index == 0)
-            {
-                AN_LOGI(TAG, "OTA upload started: %s, size: %u", filename.c_str(), request->contentLength());
-                _state.setOTATotalSize(request->contentLength());
-            }
-
-            if (Update.write(data, len) != len)
-            {
-                AN_LOGE(TAG, "OTA write failed at index %u", index);
-                _state.setOTAInProgress(false);
-                return;
-            }
-
-            _state.setOTAUploadedSize(_state.getOTAUploadedSize() + len);
-
-            if (_state.getOTATotalSize() > 0)
-            {
-                int progress = (_state.getOTAUploadedSize() * 100) / _state.getOTATotalSize();
-                static int lastProgress = -1;
-                if (progress >= lastProgress + 10)
-                {
-                    AN_LOGI(TAG, "OTA progress: %d%%", progress);
-                    lastProgress = progress;
                 }
-            }
 
-            if (final)
-            {
-                AN_LOGI(TAG, "OTA upload finished: %u bytes written", index + len);
-            } });
+                json += "\"progress\":" + String(progress);
 
-    // OTA Reboot endpoint - called by client after successful upload
-    _server->on("/ota/reboot", HTTP_POST, [&](AsyncWebServerRequest *request)
-                {
-        AN_LOGI(TAG, "Reboot request received, restarting ESP32 now");
-        request->send(200, "text/plain", "Rebooting");
+                json += "}";
 
-        // Restart immediately - response will be sent before restart
-        ESP.restart(); });
+        
 
-#ifdef AUTONETWORK_DEBUG
-    _server->on("/_an/debug/scan", HTTP_GET,
-                [&](AsyncWebServerRequest *request)
-                {
+                request->send(200, "application/json", json); });
+
+        
+
+            // OTA Upload endpoint - requires authentication
+
+            _server->on("/ota/upload", HTTP_POST, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                    // Authentication check for security-critical OTA endpoint
+
                     if (_state.isAuthEnabled() &&
+
                         !request->authenticate(_state.getAuthUsername().c_str(),
+
                                                _state.getAuthPassword().c_str()))
+
                     {
+
                         return request->requestAuthentication();
+
                     }
 
-                    AsyncJsonResponse* response = new AsyncJsonResponse();
-                    JsonObject root = response->getRoot();
+        
 
-                    root["scanState"] = static_cast<uint8_t>(_state.getScanState());
-                    root["scanActive"] = _state.isScanActive();
-                    root["scanStartTime"] = _state.getScanStartTime();
-                    root["scanStateChangeTime"] = _state.getScanStateChangeTime();
-                    root["lastScanStatus"] = _state.getLastScanStatus();
-                    root["cacheValid"] = _state.isScanCacheValid();
-                    root["cacheTimestamp"] = _state.getScanCacheTimestamp();
-                    root["cachedCount"] = _state.getCachedScanCount();
-                    root["currentTime"] = millis();
+                    AN_LOGI(TAG, "OTA upload completed - finalizing update");
 
-                    response->setLength();
-                    request->send(response);
-                });
-#endif
-}
+        
 
-void AutoNetworkPortal::_registerScanEndpoint()
-{
-    // Scan API endpoint (/_an/scan)
-    _scan_handler = &_server->on("/_an/scan", HTTP_GET,
-                                 [&](AsyncWebServerRequest *request)
-                                 {
-                                     AN_LOGV(TAG, "/_an/scan endpoint called");
+                    if (!_state.isOTAInProgress())
 
-                                     AutoNetworkRequestValidation validation{
-                                         request,
-                                         &_state,
-                                         true,  // requireAuth
-                                         true   // checkBusyState
-                                     };
-
-                                     if (!validation.validate(
-                                             _state.getAuthUsername(),
-                                             _state.getAuthPassword()))
-                                     {
-                                         return;
-                                     }
-
-                                     int16_t n = WiFi.scanComplete();
-                                     AN_LOGI(TAG, "[AutoNetworkPortal] /_an/scan endpoint - WiFi.scanComplete() = %d", n);
-
-                                     if ((n == WIFI_SCAN_FAILED || n == -2) && !_state.isScanActive())
-                                     {
-                                         unsigned long currentTime = millis();
-
-                                         if (currentTime - _lastScanRequest < DEBOUNCE_SCAN_MS)
-                                         {
-                                             AN_LOGD(TAG, "[AutoNetworkPortal] Scan debounced - too soon after last request");
-                                             return request->send(202, "text/plain", "");
-                                         }
-
-                                         AN_LOGI(TAG, "[AutoNetworkPortal] First scan request - starting WiFi scan");
-                                         _lastScanRequest = currentTime;
-                                         _restartScan();
-                                         return request->send(202, "text/plain", "");
-                                     }
-
-                                     if (n == WIFI_SCAN_RUNNING)
-                                     {
-                                         AN_LOGI(TAG, "[AutoNetworkPortal] Scan still running, returning 202");
-                                         return request->send(202, "text/plain", "");
-                                     }
-                                     else if (n == WIFI_SCAN_FAILED)
-                                     {
-                                         AN_LOGI(TAG, "[AutoNetworkPortal] Scan failed, restarting");
-                                         _restartScan();
-                                         return request->send(202, "text/plain", "");
-                                     }
-                                     else
-                                     {
-                                         AN_LOGI(TAG, "[AutoNetworkPortal] Scan complete with %d networks", n);
-                                         String output;
-                                         output.reserve(1024);
-                                         _generateScanJson(output);
-                                         AN_LOGI(TAG, "[AutoNetworkPortal] JSON size: %d bytes, restarting scan", output.length());
-                                         _restartScan();
-                                         return request->send(200, "application/json", output);
-                                     }
-                                 });
-}
-
-void AutoNetworkPortal::_registerWifiConnectEndpoint()
-{
-    // Connect API endpoint (/_an/connect)
-    _save_handler = new AsyncCallbackJsonWebHandler("/_an/connect",
-                                                    [&](AsyncWebServerRequest *request, JsonVariant &json)
-                                                    {
-                                                        AN_LOGD(TAG, "/_an/connect endpoint called");
-
-                                                        AutoNetworkRequestValidation validation{
-                                                            request,
-                                                            &_state,
-                                                            true,  // requireAuth
-                                                            true   // checkBusyState
-                                                        };
-
-                                                        if (!validation.validate(
-                                                                _state.getAuthUsername(),
-                                                                _state.getAuthPassword()))
-                                                        {
-                                                            return;
-                                                        }
-
-                                                        if (!json.is<JsonObject>() || json.size() == 0)
-                                                        {
-                                                            AN_LOGW(TAG, "Invalid JSON received");
-                                                            return request->send(400, "text/plain", "Invalid request data");
-                                                        }
-
-                                                        AN_LOGD(TAG, "Processing save request...");
-                                                        String jsonString;
-                                                        serializeJson(json, jsonString);
-                                                        AN_LOGD(TAG, "Received JSON: %s", jsonString.c_str());
-
-                                                        JsonObject obj = json.as<JsonObject>();
-
-                                                        if (obj["params"].is<JsonArray>())
-                                                        {
-                                                            JsonArray params = obj["params"];
-                                                            if (!_parseConfigJson(params))
-                                                            {
-                                                                return request->send(400, "text/plain", "Invalid data");
-                                                            }
-                                                            else
-                                                            {
-                                                                if (!obj["credentials"].is<JsonObject>())
-                                                                {
-                                                                    _state.setState(AutoNetworkPortalState::SUCCESS);
-                                                                }
-                                                            }
-                                                        }
-
-                                                        if (obj["credentials"].is<JsonObject>())
-                                                        {
-                                                            JsonObject credentials = obj["credentials"];
-                                                            if (!_parseCredentialsJson(credentials))
-                                                            {
-                                                                return request->send(400, "text/plain", "Invalid data");
-                                                            }
-                                                        }
-
-                                                        // Redirect to root after successful credential submission
-                                                        AsyncWebServerResponse *response = request->beginResponse(302, "text/plain", "Redirecting...");
-                                                        response->addHeader("Location", "/");
-                                                        return request->send(response);
-                                                    });
-    _server->addHandler(_save_handler);
-
-    // Delete API endpoint (/_an/delete)
-    _clear_handler = &_server->on("/_an/delete", HTTP_POST,
-                                  [&](AsyncWebServerRequest *request)
-                                  {
-                                      if (_state.isAuthEnabled() &&
-                                          !request->authenticate(_state.getAuthUsername().c_str(),
-                                                                 _state.getAuthPassword().c_str()))
-                                      {
-                                          return request->requestAuthentication();
-                                      }
-
-                                      if (_state.getState() == AutoNetworkPortalState::IDLE ||
-                                          _state.getState() == AutoNetworkPortalState::SUCCESS ||
-                                          _state.getState() == AutoNetworkPortalState::FAILED ||
-                                          _state.getState() == AutoNetworkPortalState::TIMEOUT)
-                                      {
-                                          _state.setState(AutoNetworkPortalState::IDLE);
-                                          request->send(200, "text/plain", "OK");
-                                      }
-                                      else
-                                      {
-                                          request->send(503, "text/plain", "Busy");
-                                      }
-                                  });
-
-    // Exit API endpoint (/_an/exit)
-    _exit_handler = &_server->on("/_an/exit", HTTP_POST,
-                                 [&](AsyncWebServerRequest *request)
-                                 {
-                                     if (_state.isAuthEnabled() &&
-                                         !request->authenticate(_state.getAuthUsername().c_str(),
-                                                                _state.getAuthPassword().c_str()))
-                                     {
-                                         return request->requestAuthentication();
-                                     }
-
-                                     if (_state.getState() == AutoNetworkPortalState::WAITING_FOR_CONNECTION ||
-                                         _state.getState() == AutoNetworkPortalState::CONNECTING_WIFI)
-                                     {
-                                         return request->send(503, "text/plain", "Busy");
-                                     }
-
-                                     if (!_state.shouldExit())
-                                     {
-                                         _state.scheduleExit();
-                                     }
-                                     return request->send(200, "text/plain", "OK");
-                                 });
-}
-
-void AutoNetworkPortal::_registerSavedNetworksEndpoint()
-{
-    // Saved Credentials Page (/_an/open)
-    _server->on("/_an/open", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        // The webpageAccessed flag is now set via the /user_active endpoint,
-        // which is triggered by JavaScript in the initial HTML page.
-        // This ensures webpageAccessed is only set on genuine user interaction.
-        AN_LOGD(TAG, "Credentials page requested");
-
-        String html = AUTONETWORK_CREDENTIALS_HTML;
-        String credList = "";
-
-        // Access credential manager via callback
-        uint8_t count = 0;
-        if (_onGetCredentialEntries)
-        {
-            count = _onGetCredentialEntries();
-        }
-
-        if (count == 0)
-        {
-            credList = "<div class=\"credential-item\">No saved credentials</div>";
-        }
-        else
-        {
-            for (uint8_t i = 0; i < count; i++)
-            {
-                AutoNetworkCredentialEntry entry;
-                if (_onGetCredentialByPriority && _onGetCredentialByPriority(i, entry))
-                {
-                    credList += "<div class=\"credential-item\">";
-                    credList += "<input type=\"checkbox\" class=\"credential-checkbox\" value=\"" + entry.ssid + "\" onchange=\"updateActionButtons()\">";
-                    credList += "<div class=\"credential-content\">";
-                    credList += "<div class=\"credential-ssid\">" + entry.ssid;
-                    if (entry.enterprise)
                     {
-                        credList += "<span class=\"badge badge-enterprise\">Enterprise</span>";
+
+                        request->send(400, "text/plain", "OTA not started");
+
+                        return;
+
                     }
-                    credList += "</div>";
-                    credList += "</div>";
-                    credList += "</div>";
-                }
-            }
-        }
 
-        html.replace("%CREDENTIALS%", credList);
-        request->send(200, "text/html", html); });
+        
 
-    // Delete specific credentials endpoint (/_an/delete_creds)
-    _server->on("/_an/delete_creds", HTTP_POST, [&](AsyncWebServerRequest *request) {}, NULL, [&](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
-                {
-            AN_LOGD(TAG, "Delete credentials request received");
+                    // Call Update.end(true) to finalize and validate the upload
 
-            JsonDocument doc;
-            DeserializationError error = deserializeJson(doc, data, len);
+                    bool success = Update.end(true);
 
-            if (error)
-            {
-                AN_LOGW(TAG, "JSON parsing failed: %s", error.c_str());
-                request->send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
-                return;
-            }
+        
 
-            JsonArray ssids = doc["ssids"];
-            if (!ssids)
-            {
-                request->send(400, "application/json", "{\"success\":false,\"message\":\"No SSIDs provided\"}");
-                return;
-            }
+                    if (success)
 
-            // Delete credentials via callback
-            int deleted = 0;
-            for (JsonVariant ssid : ssids)
-            {
-                const char* ssidStr = ssid.as<const char*>();
-                if (ssidStr && _onDeleteCredential && _onDeleteCredential(ssidStr))
-                {
-                    AN_LOGI(TAG, "Deleted credential: %s", ssidStr);
-                    deleted++;
-                }
-                else
-                {
-                    AN_LOGW(TAG, "Failed to delete credential: %s", ssidStr ? ssidStr : "(null)");
-                }
-            }
-
-            String response = "{\"success\":true,\"deleted\":" + String(deleted) + "}";
-            request->send(200, "application/json", response); });
-
-    // Connect to saved credential endpoint (/_an/connect_saved)
-    _server->on("/_an/connect_saved", HTTP_POST, [&](AsyncWebServerRequest *request) {}, NULL, [&](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total)
-                {
-            AN_LOGD(TAG, "Connect to saved credential request received");
-
-            JsonDocument doc;
-            DeserializationError error = deserializeJson(doc, data, len);
-
-            if (error)
-            {
-                AN_LOGW(TAG, "JSON parsing failed: %s", error.c_str());
-                request->send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
-                return;
-            }
-
-            const char* ssid = doc["ssid"];
-            if (!ssid || strlen(ssid) == 0)
-            {
-                request->send(400, "application/json", "{\"success\":false,\"message\":\"No SSID provided\"}");
-                return;
-            }
-
-            // Access credential manager via callback
-            AutoNetworkCredentialEntry entry;
-            bool found = false;
-            uint8_t count = 0;
-
-            if (_onGetCredentialEntries)
-            {
-                count = _onGetCredentialEntries();
-            }
-
-            for (uint8_t i = 0; i < count; i++)
-            {
-                if (_onGetCredentialByIndex && _onGetCredentialByIndex(i, entry))
-                {
-                    if (entry.ssid == String(ssid))
                     {
-                        found = true;
-                        break;
+
+                        AN_LOGI(TAG, "OTA update successful, size: %u bytes", Update.size());
+
+                        _state.setOTAInProgress(false);
+
+                        request->send(200, "text/plain", "Update successful");
+
+                        // Note: Restart will be triggered by separate /ota/reboot request
+
                     }
-                }
-            }
 
-            if (!found)
-            {
-                AN_LOGW(TAG, "Credential not found: %s", ssid);
-                request->send(404, "application/json", "{\"success\":false,\"message\":\"Credential not found\"}");
-                return;
-            }
+                    else
 
-            AN_LOGI(TAG, "Initiating connection to saved credential: %s", ssid);
+                    {
 
-            // Disconnect and connect (via callback)
-            if (_onDisconnect)
-            {
-                _onDisconnect();
-            }
+                        AN_LOGE(TAG, "OTA update failed: %s", Update.errorString());
 
-            if (entry.enterprise)
-            {
-                if (_onConnectEnterprise)
-                {
-                    _onConnectEnterprise(entry.ssid.c_str(), entry.enterpriseNetId.c_str(), entry.password.c_str());
-                }
-            }
-            else
-            {
-                if (_onConnect)
-                {
-                    _onConnect(entry.ssid.c_str(), entry.password.c_str(), false, &entry);
-                }
-            }
+                        _state.setOTAInProgress(false);
 
-            String response = "{\"success\":true,\"message\":\"Connection initiated to " + entry.ssid + "\"}";
-            request->send(200, "application/json", response); });
+                        request->send(500, "text/plain", Update.errorString());
 
-    // Disconnect endpoint (/_an/disc)
-    _server->on("/_an/disc", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        // The webpageAccessed flag is now set via the /user_active endpoint,
-        // which is triggered by JavaScript in the initial HTML page.
-        // This ensures webpageAccessed is only set on genuine user interaction.
-        AN_LOGI(TAG, "Manual disconnect requested. Starting portal.");
+                    } }, [&](AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final)
 
-        // 1. Disconnect from WiFi
-        if (_onDisconnect) {
-            _onDisconnect();
-        }
+                        {
 
-        // 2. Immediately start the portal (which starts the AP)
-        start();
+                    if (!_state.isOTAInProgress())
 
-        // 3. Redirect to the portal's IP address
-        AsyncWebServerResponse *response = request->beginResponse(302, "text/plain", "Redirecting...");
-        response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/_an");
-        request->send(response);
-    });
-}
+                    {
 
-void AutoNetworkPortal::_registerResetEndpoint()
-{
-    // Reset endpoint (/_an/reset)
-    _server->on("/_an/reset", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        AN_LOGI(TAG, "Reset requested");
+                        AN_LOGW(TAG, "OTA upload received but not started");
 
-        AutoNetworkRequestValidation validation{
-            request,
-            &_state,
-            true,   // requireAuth
-            false   // checkBusyState - reset allowed when busy
-        };
+                        return;
 
-        if (!validation.validate(_state.getAuthUsername(), _state.getAuthPassword()))
-        {
-            return;
-        }
+                    }
 
-        AN_LOGI(TAG, "Reset authorized - redirecting and restarting");
+        
 
-        // Send a server-side redirect to the root page
-        AsyncWebServerResponse *response = request->beginResponse(302, "text/plain", "Redirecting...");
-        response->addHeader("Location", "/");
-        request->send(response);
+                    // Static variable for progress tracking - must be reset on each new upload
 
-        // Restart the ESP32 after a short delay to allow the response to be sent
-        static bool resetScheduled = false;
-        if (!resetScheduled) {
-            resetScheduled = true;
-            xTaskCreate([](void* param) {
-                vTaskDelay(pdMS_TO_TICKS(100)); // Short delay
-                ESP.restart();
-            }, "reset_task", 2048, NULL, 1, NULL);
-        }
-    });
-}
+                    static int8_t lastProgress = -1;
 
-void AutoNetworkPortal::_registerUserActiveEndpoint()
-{
-    // Dedicated endpoint for JavaScript signal of genuine user interaction
-    _server->on("/user_active", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        // Mark the client's IP as active to indicate genuine user interaction.
-        // This prevents automated captive portal probes from triggering webpageAccessed.
-        _activeUsers.insert(request->client()->remoteIP()); // Access remoteIP via pointer
-        AN_LOGD(TAG, "Client %s marked as active via /user_active endpoint", request->client()->remoteIP().toString().c_str()); // Access remoteIP via pointer
+        
 
-        // Signal AutoNetwork that a user-facing page has been accessed.
-        // This triggers the OLED display transition to State 4.
-        if (_onSetWebpageAccessed) {
-            _onSetWebpageAccessed();
-        }
-        request->send(200, "text/plain", "OK"); });
-}
+                    if (index == 0)
 
-void AutoNetworkPortal::_registerCaptiveEndpoints()
-{
-    // Android/Google connectivity probes
-    _server->on("/generate_204", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        AN_LOGV(TAG, "Android/Google connectivity probe detected");
-        request->redirect("/_an"); })
-        .setFilter(this->_onAPFilter);
+                    {
 
-    _server->on("/gen_204", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        AN_LOGV(TAG, "Android/Google connectivity probe detected");
-        request->redirect("/_an"); })
-        .setFilter(this->_onAPFilter);
+                        AN_LOGI(TAG, "OTA upload started: %s, size: %u", filename.c_str(), request->contentLength());
 
-    // Apple (iOS/macOS) connectivity probes
-    _server->on("/hotspot-detect.html", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        AN_LOGV(TAG, "Apple iOS/macOS connectivity probe detected");
-        request->redirect("/_an"); })
-        .setFilter(this->_onAPFilter);
+                        _state.setOTATotalSize(request->contentLength());
 
-    _server->on("/library/test/success.html", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        AN_LOGV(TAG, "Apple connectivity probe detected");
-        request->redirect("/_an"); })
-        .setFilter(this->_onAPFilter);
+                        lastProgress = -1;  // Reset progress tracking for new upload
 
-    // Microsoft Windows connectivity probes
-    _server->on("/ncsi.txt", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        AN_LOGV(TAG, "Windows NCSI connectivity probe detected");
-        request->redirect("/_an"); })
-        .setFilter(this->_onAPFilter);
+                    }
 
-    _server->on("/connecttest.txt", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        AN_LOGV(TAG, "Windows connectivity probe detected");
-        request->redirect("/_an"); })
-        .setFilter(this->_onAPFilter);
+        
 
-    _server->on("/fwlink", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        // Respond with 204 No Content to satisfy Windows captive portal probes without triggering webpageAccessed.
-        AN_LOGV(TAG, "Windows fwlink check - responding with 204 No Content");
-        request->send(204); })
-        .setFilter(this->_onAPFilter);
+                    if (Update.write(data, len) != len)
 
-}
+                    {
 
-void AutoNetworkPortal::_registerMenuEndpoint()
-{
-    // AutoNetwork Menu Page (/_an)
-    // IMPORTANT: This MUST be registered LAST after all /_an/* endpoints
-    // to avoid catching requests meant for more specific routes
-    _server->on("/_an", HTTP_GET, [&](AsyncWebServerRequest *request)
-                {
-        AN_LOGD(TAG, "Menu page requested");
+                        AN_LOGE(TAG, "OTA write failed at index %u", index);
 
-        String html = AUTONETWORK_MENU_HTML;
+                        Update.abort();  // Clean up Update subsystem to allow future OTA attempts
 
-        if (WiFi.status() == WL_CONNECTED)
-        {
-            html.replace("%STATUS%", "Connected");
-            html.replace("%STATUS_CLASS%", "status-connected");
-            html.replace("%SSID%", WiFi.SSID());
-            html.replace("%IP%", WiFi.localIP().toString());
-        }
-        else
-        {
-            html.replace("%STATUS%", "Disconnected");
-            html.replace("%STATUS_CLASS%", "status-disconnected");
-            html.replace("%SSID%", "None");
-            html.replace("%IP%", WiFi.softAPIP().toString());
-        }
+                        _state.setOTAInProgress(false);
 
-        // Get credential count via callback
-        uint8_t credCount = 0;
-        if (_onGetCredentialEntries)
-        {
-            credCount = _onGetCredentialEntries();
-        }
-        html.replace("%COUNT%", String(credCount));
+                        return;
 
-        request->send(200, "text/html", html);
-    });
-}
+                    }
 
-void AutoNetworkPortal::_registerEndpoints()
-{
-    AN_LOGI(TAG, "Registering HTTP endpoints...");
+        
 
-    // Root endpoint is now handled by AutoNetwork::_registerRootHandler()
-    _registerStaticResourceEndpoints();
-    _registerPortalPageEndpoint();
-    _registerInfoEndpoint();
-    _registerOTAEndpoints();
-    _registerScanEndpoint();
-    _registerWifiConnectEndpoint();
-    _registerSavedNetworksEndpoint();
-    _registerResetEndpoint();
-    _registerUserActiveEndpoint();
-    _registerCaptiveEndpoints();
-    // CRITICAL: Menu endpoint MUST be registered LAST to avoid catching /_an/* routes
-    _registerMenuEndpoint();
+                    _state.setOTAUploadedSize(_state.getOTAUploadedSize() + len);
 
-    AN_LOGI(TAG, "HTTP endpoints registered successfully");
-}
+        
 
-void AutoNetworkPortal::_unregisterEndpoints()
-{
-    AN_LOGI(TAG, "Unregistering HTTP endpoints...");
+                    if (_state.getOTATotalSize() > 0)
 
-    if (_index_handler != nullptr)
-    {
-        _server->removeHandler(_index_handler);
-        _index_handler = nullptr;
-    }
+                    {
 
-    if (_status_handler != nullptr)
-    {
-        _server->removeHandler(_status_handler);
-        _status_handler = nullptr;
-    }
+                        // Use 64-bit arithmetic to prevent overflow with large files
 
-    if (_schema_handler != nullptr)
-    {
-        _server->removeHandler(_schema_handler);
-        _schema_handler = nullptr;
-    }
+                        uint64_t calcProgress = ((uint64_t)_state.getOTAUploadedSize() * 100ULL) / _state.getOTATotalSize();
 
-    if (_scan_handler != nullptr)
-    {
-        _server->removeHandler(_scan_handler);
-        _scan_handler = nullptr;
-    }
+                        int8_t progress = (calcProgress > 100) ? 100 : (int8_t)calcProgress;
 
-    if (_save_handler != nullptr)
-    {
-        _server->removeHandler(_save_handler);
-        _save_handler = nullptr;
-    }
+                        if (progress >= lastProgress + 10)
 
-    if (_clear_handler != nullptr)
-    {
-        _server->removeHandler(_clear_handler);
-        _clear_handler = nullptr;
-    }
+                        {
 
-    if (_exit_handler != nullptr)
-    {
-        _server->removeHandler(_exit_handler);
-        _exit_handler = nullptr;
-    }
+                            AN_LOGI(TAG, "OTA progress: %d%%", progress);
 
-    AN_LOGI(TAG, "HTTP endpoints unregistered");
-}
+                            lastProgress = progress;
 
-// Private Methods - JSON Generation
-// ****************************************************************************
-
-void AutoNetworkPortal::_generateStatusJson(String &str)
-{
-    uint8_t status = 0;
-    String staSSID = "";
-
-    if (_onGetStatus)
-    {
-        status = _onGetStatus();
-    }
-
-    if (_onGetSTASSID)
-    {
-        staSSID = _onGetSTASSID();
-    }
-
-    AutoNetworkJsonBuilder::buildStatusJson(
-        str,
-        status,
-        (WiFi.status() == WL_CONNECTED),
-        staSSID,
-        WiFi.macAddress(),
-        WiFi.localIP().toString(),
-        (uint8_t)_state.getState(),
-        _state.isActive());
-}
-
-void AutoNetworkPortal::_generateSchemaJson(String &str)
-{
-    extern struct AutoNetworkParameterTypeNames paramTypes[];
-
-    AutoNetworkJsonBuilder::buildSchemaJson(
-        str,
-        _state.getParameters().Data(),
-        _state.getParameters().Size(),
-        paramTypes);
-}
-
-void AutoNetworkPortal::_generateScanJson(String &str)
-{
-    JsonDocument json;
-
-    JsonArray arr = json.to<JsonArray>();
-
-    for (uint16_t i = 0; i < WiFi.scanComplete(); i++)
-    {
-        JsonObject obj = arr.add<JsonObject>();
-        obj["s"] = WiFi.SSID(i);
-        obj["b"] = WiFi.BSSIDstr(i);
-        obj["r"] = WiFi.RSSI(i);
-        obj["c"] = WiFi.channel(i);
-
-        AutoNetworkEncryptionType enc = AutoNetworkEncryptionType::OPEN;
-        switch (WiFi.encryptionType(i))
-        {
-        case WIFI_AUTH_OPEN:
-            enc = AutoNetworkEncryptionType::OPEN;
-            break;
-        case WIFI_AUTH_WEP:
-            enc = AutoNetworkEncryptionType::WEP;
-            break;
-        case WIFI_AUTH_WPA_PSK:
-            enc = AutoNetworkEncryptionType::WPA_PSK;
-            break;
-        case WIFI_AUTH_WPA2_PSK:
-            enc = AutoNetworkEncryptionType::WPA2_PSK;
-            break;
-        case WIFI_AUTH_WPA_WPA2_PSK:
-            enc = AutoNetworkEncryptionType::WPA_WPA2_PSK;
-            break;
-        case WIFI_AUTH_WPA2_ENTERPRISE:
-            enc = AutoNetworkEncryptionType::WPA2_ENTERPRISE;
-            break;
-        case WIFI_AUTH_WPA3_PSK:
-            enc = AutoNetworkEncryptionType::WPA3_PSK;
-            break;
-        case WIFI_AUTH_WPA2_WPA3_PSK:
-            enc = AutoNetworkEncryptionType::WPA2_WPA3_PSK;
-            break;
-        case WIFI_AUTH_WAPI_PSK:
-            enc = AutoNetworkEncryptionType::WAPI_PSK;
-            break;
-        case WIFI_AUTH_WPA3_ENT_192:
-            enc = AutoNetworkEncryptionType::WPA3_ENT_192;
-            break;
-        case WIFI_AUTH_MAX:
-            enc = AutoNetworkEncryptionType::MAX;
-            break;
-        default:
-            enc = AutoNetworkEncryptionType::UNKNOWN;
-            break;
-        }
-        obj["e"] = (uint8_t)enc;
-    }
-    serializeJson(json, str);
-    json.clear();
-}
-
-// Private Methods - JSON Parsing
-// ****************************************************************************
-
-bool AutoNetworkPortal::_parseConfigJson(JsonArray &arr)
-{
-    // Validate parameters
-    for (uint8_t i = 0; i < arr.size(); i++)
-    {
-        JsonObject obj = arr[i];
-
-        if (!obj["id"].is<JsonVariant>() || !obj["v"].is<JsonVariant>())
-        {
-            return false;
-        }
-
-        if (!obj["v"].is<const char *>())
-        {
-            return false;
-        }
-    }
-
-    // Parse parameters
-    for (uint8_t i = 0; i < arr.size(); i++)
-    {
-        JsonObject obj = arr[i];
-        for (int j = 0; j < _state.getParameters().Size(); j++)
-        {
-            AutoNetworkParameter *p = _state.getParameters()[j];
-            if (p->_id == obj["id"].as<uint32_t>())
-            {
-                p->_value = obj["v"].as<const char *>();
-                break;
-            }
-        }
-    }
-
-    if (_state.getConfigCallback() != nullptr)
-    {
-        return _state.getConfigCallback()();
-    }
-    else
-    {
-        return true;
-    }
-}
-
-bool AutoNetworkPortal::_parseCredentialsJson(JsonObject &obj)
-{
-        if (obj["ssid"].is<const char *>() && obj["password"].is<const char *>()) {
-            _state.setSTASSID(obj["ssid"].as<const char *>());
-            _state.setSTAPassword(obj["password"].as<const char *>());
-    
-                    _state.setSTAChannel(0);
-            
-                    if (obj["bssid"].is<const char*>()) {
-                        const char* bssidStr = obj["bssid"].as<const char*>();
-                        uint8_t bssid[6];
-                        if (sscanf(bssidStr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &bssid[0], &bssid[1], &bssid[2], &bssid[3], &bssid[4], &bssid[5]) == 6) {
-                            _state.setSTABSSID(bssid);
-                        } else {
-                            _state.setSTABSSID(nullptr);
                         }
-                    } else {
-                        _state.setSTABSSID(nullptr);
+
                     }
-            
-                    // Set manual connection flag
-            _state.setManualConnection(true);
 
-        // Parse enterprise fields if present
-        if (obj["enterprise"].is<bool>() && obj["enterprise"].as<bool>())
-        {
-            _state.setEnterpriseMode(true);
-            if (obj["netid"].is<const char *>())
-            {
-                _state.setEnterpriseNetId(obj["netid"].as<const char *>());
-                AN_LOGI(TAG, "Enterprise credentials parsed");
-                AN_LOGD(TAG, "Enterprise - NetID: %s",
-                         _state.getEnterpriseNetId().c_str());
-            }
-        }
-        else
-        {
-            _state.setEnterpriseMode(false);
-            _state.setEnterpriseNetId("");
-        }
+        
 
-        // Set portal state
-        _state.setState(AutoNetworkPortalState::CONNECTING_WIFI);
-        AN_LOGI(TAG, "Starting WiFi connection to SSID: %s (Ent: %s)",
-                 _state.getSTASSID().c_str(),
-                 _state.isEnterpriseMode() ? "Yes" : "No");
+                    if (final)
 
-        return true;
-    }
-    else
-    {
-        return false;
-    }
-}
+                    {
 
-// Private Methods - Credential Management
-// ****************************************************************************
+                        AN_LOGI(TAG, "OTA upload finished: %u bytes written", index + len);
 
-bool AutoNetworkPortal::_saveCredentialEntry(const AutoNetworkCredentialEntry &entry)
-{
-    // Check credential limit before saving (via callback)
-    if (_onGetCredentialEntries && _onGetConfig)
-    {
-        uint8_t currentCount = _onGetCredentialEntries();
-        const AutoNetworkConfig &config = _onGetConfig();
+                    } });
 
-        if (currentCount >= config.credentialsMax)
-        {
-            AN_LOGW(TAG, "Credential limit reached (%d/%d) - oldest credential will be replaced",
-                     currentCount, config.credentialsMax);
+        
 
-            // Find and delete oldest credential (lowest lastUsed timestamp)
-            AutoNetworkCredentialEntry oldestEntry;
-            if (_onGetCredentialByRecent && _onGetCredentialByRecent(config.credentialsMax - 1, oldestEntry))
-            {
-                if (_onDeleteCredential)
+            // OTA Reboot endpoint - called by client after successful upload, requires authentication
+
+            _server->on("/ota/reboot", HTTP_POST, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                // Authentication check for security-critical OTA endpoint
+
+                if (_state.isAuthEnabled() &&
+
+                    !request->authenticate(_state.getAuthUsername().c_str(),
+
+                                           _state.getAuthPassword().c_str()))
+
                 {
-                    _onDeleteCredential(oldestEntry.ssid.c_str());
-                    AN_LOGI(TAG, "Deleted oldest credential: %s (lastUsed=%lu)",
-                             oldestEntry.ssid.c_str(), oldestEntry.lastUsed);
+
+                    return request->requestAuthentication();
+
                 }
-            }
+
+        
+
+                AN_LOGI(TAG, "Reboot request received, restarting ESP32 now");
+
+                request->send(200, "text/plain", "Rebooting");
+
+        
+
+                // Restart immediately - response will be sent before restart
+
+                ESP.restart(); });
+
+        
+
+        #ifdef AUTONETWORK_DEBUG
+
+            _server->on("/_an/debug/scan", HTTP_GET,
+
+                        [&](AsyncWebServerRequest* request)
+
+                        {
+
+                            if (_state.isAuthEnabled() &&
+
+                                !request->authenticate(_state.getAuthUsername().c_str(),
+
+                                                       _state.getAuthPassword().c_str()))
+
+                            {
+
+                                return request->requestAuthentication();
+
+                            }
+
+        
+
+                            AsyncJsonResponse* response = new AsyncJsonResponse();
+
+                            JsonObject root = response->getRoot();
+
+        
+
+                            root["scanState"] = static_cast<uint8_t>(_state.getScanState());
+
+                            root["scanActive"] = _state.isScanActive();
+
+                            root["scanStartTime"] = _state.getScanStartTime();
+
+                            root["scanStateChangeTime"] = _state.getScanStateChangeTime();
+
+                            root["lastScanStatus"] = _state.getLastScanStatus();
+
+                            root["cacheValid"] = _state.isScanCacheValid();
+
+                            root["cacheTimestamp"] = _state.getScanCacheTimestamp();
+
+                            root["cachedCount"] = _state.getCachedScanCount();
+
+                            root["currentTime"] = millis();
+
+        
+
+                            response->setLength();
+
+                            request->send(response);
+
+                        });
+
+        #endif
+
         }
-    }
 
-    if (_onSaveCredential && _onSaveCredential(entry))
-    {
-        AN_LOGI(TAG, "Saved new credential: %s (lastUsed=%lu)", entry.ssid.c_str(), entry.lastUsed);
-        return true;
-    }
-    else
-    {
-        AN_LOGE(TAG, "Failed to save credential: %s", entry.ssid.c_str());
-        return false;
-    }
-}
+        
 
-// Private Methods - WiFi Scanning
-// ****************************************************************************
+        void AutoNetworkPortal::_registerScanEndpoint()
 
-void AutoNetworkPortal::_restartScan()
-{
-    AN_LOGI(TAG, "[AutoNetworkPortal] _restartScan() called");
-    if (_onRequestScan)
-    {
-        AN_LOGI(TAG, "[AutoNetworkPortal] Delegating scan request to parent");
-        _onRequestScan();
-    }
-    else
-    {
-        AN_LOGE(TAG, "[AutoNetworkPortal] Scan request failed: _onRequestScan callback is not set!");
-    }
-}
+        {
 
-// Private Methods - Request Filtering
-// ****************************************************************************
+            // Scan API endpoint (/_an/scan)
 
-bool AutoNetworkPortal::_onAPFilter(AsyncWebServerRequest *request)
-{
-    // Allow requests when portal is active (stations connected to AP)
-    return WiFi.softAPgetStationNum() > 0;
-}
+            _scan_handler = &_server->on("/_an/scan", HTTP_GET,
+
+                                         [&](AsyncWebServerRequest* request)
+
+                                         {
+
+                                             AN_LOGV(TAG, "/_an/scan endpoint called");
+
+        
+
+                                             AutoNetworkRequestValidation validation{
+
+                                                 request,
+
+                                                 &_state,
+
+                                                 true,  // requireAuth
+
+                                                 true   // checkBusyState
+
+                                             };
+
+        
+
+                                             if (!validation.validate(
+
+                                                     _state.getAuthUsername(),
+
+                                                     _state.getAuthPassword()))
+
+                                             {
+
+                                                 return;
+
+                                             }
+
+        
+
+                                             int16_t n = WiFi.scanComplete();
+
+                                             AN_LOGI(TAG, "[AutoNetworkPortal] /_an/scan endpoint - WiFi.scanComplete() = %d", n);
+
+        
+
+                                             if ((n == WIFI_SCAN_FAILED || n == -2) && !_state.isScanActive())
+
+                                             {
+
+                                                 unsigned long currentTime = millis();
+
+        
+
+                                                 if (currentTime - _lastScanRequest < DEBOUNCE_SCAN_MS)
+
+                                                 {
+
+                                                     AN_LOGD(TAG, "[AutoNetworkPortal] Scan debounced - too soon after last request");
+
+                                                     return request->send(202, "text/plain", "");
+
+                                                 }
+
+        
+
+                                                 AN_LOGI(TAG, "[AutoNetworkPortal] First scan request - starting WiFi scan");
+
+                                                 _lastScanRequest = currentTime;
+
+                                                 _restartScan();
+
+                                                 return request->send(202, "text/plain", "");
+
+                                             }
+
+        
+
+                                             if (n == WIFI_SCAN_RUNNING)
+
+                                             {
+
+                                                 AN_LOGI(TAG, "[AutoNetworkPortal] Scan still running, returning 202");
+
+                                                 return request->send(202, "text/plain", "");
+
+                                             }
+
+                                             else if (n == WIFI_SCAN_FAILED)
+
+                                             {
+
+                                                 AN_LOGI(TAG, "[AutoNetworkPortal] Scan failed, restarting");
+
+                                                 _restartScan();
+
+                                                 return request->send(202, "text/plain", "");
+
+                                             }
+
+                                             else
+
+                                             {
+
+                                                 AN_LOGI(TAG, "[AutoNetworkPortal] Scan complete with %d networks", n);
+
+                                                 String output;
+
+                                                 output.reserve(AUTONETWORK_SCAN_JSON_SIZE);
+
+                                                 _generateScanJson(output);
+
+                                                 AN_LOGI(TAG, "[AutoNetworkPortal] JSON size: %d bytes, restarting scan", output.length());
+
+                                                 _restartScan();
+
+                                                 return request->send(200, "application/json", output);
+
+                                             }
+
+                                         });
+
+        }
+
+        
+
+        void AutoNetworkPortal::_registerWifiConnectEndpoint()
+
+        {
+
+            // Connect API endpoint (/_an/connect)
+
+            _save_handler = new AsyncCallbackJsonWebHandler("/_an/connect",
+
+                                                            [&](AsyncWebServerRequest* request, JsonVariant &json)
+
+                                                            {
+
+                                                                AN_LOGD(TAG, "/_an/connect endpoint called");
+
+        
+
+                                                                AutoNetworkRequestValidation validation{
+
+                                                                    request,
+
+                                                                    &_state,
+
+                                                                    true,  // requireAuth
+
+                                                                    true   // checkBusyState
+
+                                                                };
+
+        
+
+                                                                if (!validation.validate(
+
+                                                                        _state.getAuthUsername(),
+
+                                                                        _state.getAuthPassword()))
+
+                                                                {
+
+                                                                    return;
+
+                                                                }
+
+        
+
+                                                                if (!json.is<JsonObject>() || json.size() == 0)
+
+                                                                {
+
+                                                                    AN_LOGW(TAG, "Invalid JSON received");
+
+                                                                    return request->send(400, "text/plain", "Invalid request data");
+
+                                                                }
+
+        
+
+                                                                AN_LOGD(TAG, "Processing save request...");
+
+                                                                String jsonString;
+
+                                                                serializeJson(json, jsonString);
+
+                                                                AN_LOGD(TAG, "Received JSON: %s", jsonString.c_str());
+
+        
+
+                                                                JsonObject obj = json.as<JsonObject>();
+
+        
+
+                                                                if (obj["params"].is<JsonArray>())
+
+                                                                {
+
+                                                                    JsonArray params = obj["params"];
+
+                                                                    if (!_parseConfigJson(params))
+
+                                                                    {
+
+                                                                        return request->send(400, "text/plain", "Invalid data");
+
+                                                                    }
+
+                                                                    else
+
+                                                                    {
+
+                                                                        if (!obj["credentials"].is<JsonObject>())
+
+                                                                        {
+
+                                                                            _state.setState(AutoNetworkPortalState::SUCCESS);
+
+                                                                        }
+
+                                                                    }
+
+                                                                }
+
+        
+
+                                                                if (obj["credentials"].is<JsonObject>())
+
+                                                                {
+
+                                                                    JsonObject credentials = obj["credentials"];
+
+                                                                    if (!_parseCredentialsJson(credentials))
+
+                                                                    {
+
+                                                                        return request->send(400, "text/plain", "Invalid data");
+
+                                                                    }
+
+                                                                }
+
+        
+
+                                                                // Redirect to root after successful credential submission
+
+                                                                AsyncWebServerResponse* response = request->beginResponse(302, "text/plain", "Redirecting...");
+
+                                                                response->addHeader("Location", "/");
+
+                                                                return request->send(response);
+
+                                                            });
+
+            _server->addHandler(_save_handler);
+
+        
+
+            // Delete API endpoint (/_an/delete)
+
+            _clear_handler = &_server->on("/_an/delete", HTTP_POST,
+
+                                          [&](AsyncWebServerRequest* request)
+
+                                          {
+
+                                              if (_state.isAuthEnabled() &&
+
+                                                  !request->authenticate(_state.getAuthUsername().c_str(),
+
+                                                                         _state.getAuthPassword().c_str()))
+
+                                              {
+
+                                                  return request->requestAuthentication();
+
+                                              }
+
+        
+
+                                              if (_state.getState() == AutoNetworkPortalState::IDLE ||
+
+                                                  _state.getState() == AutoNetworkPortalState::SUCCESS ||
+
+                                                  _state.getState() == AutoNetworkPortalState::FAILED ||
+
+                                                  _state.getState() == AutoNetworkPortalState::TIMEOUT)
+
+                                              {
+
+                                                  _state.setState(AutoNetworkPortalState::IDLE);
+
+                                                  request->send(200, "text/plain", "OK");
+
+                                              }
+
+                                              else
+
+                                              {
+
+                                                  request->send(503, "text/plain", "Busy");
+
+                                              }
+
+                                          });
+
+        
+
+            // Exit API endpoint (/_an/exit)
+
+            _exit_handler = &_server->on("/_an/exit", HTTP_POST,
+
+                                         [&](AsyncWebServerRequest* request)
+
+                                         {
+
+                                             if (_state.isAuthEnabled() &&
+
+                                                 !request->authenticate(_state.getAuthUsername().c_str(),
+
+                                                                        _state.getAuthPassword().c_str()))
+
+                                             {
+
+                                                 return request->requestAuthentication();
+
+                                             }
+
+        
+
+                                             if (_state.getState() == AutoNetworkPortalState::WAITING_FOR_CONNECTION ||
+
+                                                 _state.getState() == AutoNetworkPortalState::CONNECTING_WIFI)
+
+                                             {
+
+                                                 return request->send(503, "text/plain", "Busy");
+
+                                             }
+
+        
+
+                                             if (!_state.shouldExit())
+
+                                             {
+
+                                                 _state.scheduleExit();
+
+                                             }
+
+                                             return request->send(200, "text/plain", "OK");
+
+                                         });
+
+        }
+
+        
+
+        void AutoNetworkPortal::_registerSavedNetworksEndpoint()
+
+        {
+
+            // Saved Credentials Page (/_an/open)
+
+            _server->on("/_an/open", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                // The webpageAccessed flag is now set via the /user_active endpoint,
+
+                // which is triggered by JavaScript in the initial HTML page.
+
+                // This ensures webpageAccessed is only set on genuine user interaction.
+
+                AN_LOGD(TAG, "Credentials page requested");
+
+        
+
+                String html = AUTONETWORK_CREDENTIALS_HTML;
+
+                                char credListBuffer[4096]; // Increased buffer size for safety
+
+                                char* currentPtr = credListBuffer;
+
+                                size_t remainingSize = sizeof(credListBuffer);
+
+                                int written = 0;
+
+                
+
+                                // Access credential manager via callback
+
+                                uint8_t count = 0;
+
+                                if (_onGetCredentialEntries != nullptr)
+
+                                {
+
+                                    count = _onGetCredentialEntries();
+
+                                }
+
+                
+
+                                if (count == 0)
+
+                                {
+
+                                    written = snprintf(currentPtr, remainingSize, "<div class=\"credential-item\">No saved credentials</div>");
+
+                                    if (written < 0 || (size_t)written >= remainingSize) {
+
+                                        AN_LOGE(TAG, "Buffer overflow in credListBuffer (no credentials)");
+
+                                        // Handle error or truncate, for now, just log
+
+                                    }
+
+                                    currentPtr += written;
+
+                                    remainingSize -= written;
+
+                                }
+
+                                                else
+
+                                                {
+
+                                                    for (uint8_t i = 0; i < count; i++)
+
+                                                    {
+
+                                                        AutoNetworkCredentialEntry entry;
+
+                                                        if (_onGetCredentialByPriority != nullptr && _onGetCredentialByPriority(i, entry))
+
+                                                        {
+
+                                                            // BSSID string for display
+
+                                                            char bssidStr[18]; // XX:XX:XX:XX:XX:XX\0
+
+                                                            snprintf(bssidStr, sizeof(bssidStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+
+                                                                     entry.bssid[0], entry.bssid[1], entry.bssid[2],
+
+                                                                     entry.bssid[3], entry.bssid[4], entry.bssid[5]);
+
+                                
+
+                                                            written = snprintf(currentPtr, remainingSize, "<div class=\"credential-item\">");
+
+                                                            if (written < 0 || (size_t)written >= remainingSize) { AN_LOGE(TAG, "Buffer overflow in credListBuffer (item start)"); break; }
+
+                                                            currentPtr += written;
+
+                                                            remainingSize -= written;
+
+                                
+
+                                                            written = snprintf(currentPtr, remainingSize, "<input type=\"checkbox\" class=\"credential-checkbox\" value=\"%s\" onchange=\"updateActionButtons()\">", escapeHtml(entry.ssid).c_str());
+
+                                                            if (written < 0 || (size_t)written >= remainingSize) { AN_LOGE(TAG, "Buffer overflow in credListBuffer (checkbox)"); break; }
+
+                                                            currentPtr += written;
+
+                                                            remainingSize -= written;
+
+                                
+
+                                                            written = snprintf(currentPtr, remainingSize, "<div class=\"credential-content\">");
+
+                                                            if (written < 0 || (size_t)written >= remainingSize) { AN_LOGE(TAG, "Buffer overflow in credListBuffer (content start)"); break; }
+
+                                                            currentPtr += written;
+
+                                                            remainingSize -= written;
+
+                                
+
+                                                            written = snprintf(currentPtr, remainingSize, "<div class=\"credential-ssid\">%s", escapeHtml(entry.ssid).c_str());
+
+                                                            if (written < 0 || (size_t)written >= remainingSize) { AN_LOGE(TAG, "Buffer overflow in credListBuffer (ssid)"); break; }
+
+                                                            currentPtr += written;
+
+                                                            remainingSize -= written;
+
+                                
+
+                                                            if (entry.enterprise)
+
+                                                            {
+
+                                                                written = snprintf(currentPtr, remainingSize, "<span class=\"badge badge-enterprise\">Enterprise</span>");
+
+                                                                if (written < 0 || (size_t)written >= remainingSize) { AN_LOGE(TAG, "Buffer overflow in credListBuffer (enterprise badge)"); break; }
+
+                                                                currentPtr += written;
+
+                                                                remainingSize -= written;
+
+                                                            }
+
+                                                            written = snprintf(currentPtr, remainingSize, "</div>"); // Close credential-ssid
+
+                                                            if (written < 0 || (size_t)written >= remainingSize) { AN_LOGE(TAG, "Buffer overflow in credListBuffer (ssid close)"); break; }
+
+                                                            currentPtr += written;
+
+                                                            remainingSize -= written;
+
+                                
+
+                                
+
+                                                            written = snprintf(currentPtr, remainingSize, "<div class=\"credential-info\"><span class=\"label\">BSSID:</span>%s</div>", bssidStr);
+
+                                                            if (written < 0 || (size_t)written >= remainingSize) { AN_LOGE(TAG, "Buffer overflow in credListBuffer (bssid info)"); break; }
+
+                                                            currentPtr += written;
+
+                                                            remainingSize -= written;
+
+                                
+
+                                
+
+                                                            written = snprintf(currentPtr, remainingSize, "</div>"); // Close credential-content
+
+                                                            if (written < 0 || (size_t)written >= remainingSize) { AN_LOGE(TAG, "Buffer overflow in credListBuffer (content close)"); break; }
+
+                                                            currentPtr += written;
+
+                                                            remainingSize -= written;
+
+                                
+
+                                                            written = snprintf(currentPtr, remainingSize, "</div>"); // Close credential-item
+
+                                                            if (written < 0 || (size_t)written >= remainingSize) { AN_LOGE(TAG, "Buffer overflow in credListBuffer (item close)"); break; }
+
+                                                            currentPtr += written;
+
+                                                            remainingSize -= written;
+
+                                                        }
+
+                                                    }
+
+                                                }
+
+                                        
+
+                                                html.replace("%CREDENTIALS%", credListBuffer);
+
+                request->send(200, "text/html", html); });
+
+        
+
+            // Delete specific credentials endpoint (/_an/delete_creds)
+
+            _server->on("/_an/delete_creds", HTTP_POST, [&](AsyncWebServerRequest* request) {}, NULL, [&](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total)
+
+                        {
+
+                    AN_LOGD(TAG, "Delete credentials request received");
+
+        
+
+                    JsonDocument doc;
+
+                    DeserializationError error = deserializeJson(doc, data, len);
+
+        
+
+                    if (error)
+
+                    {
+
+                        AN_LOGW(TAG, "JSON parsing failed: %s", error.c_str());
+
+                        request->send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+
+                        return;
+
+                    }
+
+        
+
+                    JsonArray ssids = doc["ssids"];
+
+                    if (!ssids)
+
+                    {
+
+                        request->send(400, "application/json", "{\"success\":false,\"message\":\"No SSIDs provided\"}");
+
+                        return;
+
+                    }
+
+        
+
+                    // Delete credentials via callback
+
+                    int deleted = 0;
+
+                    for (JsonVariant ssid : ssids)
+
+                    {
+
+                        const char* ssidStr = ssid.as<const char*>();
+
+                        if (ssidStr != nullptr && _onDeleteCredential != nullptr && _onDeleteCredential(ssidStr))
+
+                        {
+
+                            AN_LOGI(TAG, "Deleted credential: %s", ssidStr);
+
+                            deleted++;
+
+                        }
+
+                        else
+
+                        {
+
+                            AN_LOGW(TAG, "Failed to delete credential: %s", (ssidStr != nullptr) ? ssidStr : "(null)");
+
+                        }
+
+                    }
+
+        
+
+                    String response = "{\"success\":true,\"deleted\":" + String(deleted) + "}";
+
+                    request->send(200, "application/json", response); });
+
+        
+
+            // Connect to saved credential endpoint (/_an/connect_saved)
+
+            _server->on("/_an/connect_saved", HTTP_POST, [&](AsyncWebServerRequest* request) {}, NULL, [&](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total)
+
+                        {
+
+                    AN_LOGD(TAG, "Connect to saved credential request received");
+
+        
+
+                    JsonDocument doc;
+
+                    DeserializationError error = deserializeJson(doc, data, len);
+
+        
+
+                    if (error)
+
+                    {
+
+                        AN_LOGW(TAG, "JSON parsing failed: %s", error.c_str());
+
+                        request->send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+
+                        return;
+
+                    }
+
+        
+
+                    const char* ssid = doc["ssid"];
+
+                    if (!ssid || strlen(ssid) == 0)
+
+                    {
+
+                        request->send(400, "application/json", "{\"success\":false,\"message\":\"No SSID provided\"}");
+
+                        return;
+
+                    }
+
+        
+
+                    // Access credential manager via callback
+
+                    AutoNetworkCredentialEntry entry;
+
+                    bool found = false;
+
+                    uint8_t count = 0;
+
+        
+
+                    if (_onGetCredentialEntries != nullptr)
+
+                    {
+
+                        count = _onGetCredentialEntries();
+
+                    }
+
+        
+
+                    for (uint8_t i = 0; i < count; i++)
+
+                    {
+
+                        if (_onGetCredentialByIndex != nullptr && _onGetCredentialByIndex(i, entry))
+
+                        {
+
+                            if (entry.ssid == String(ssid))
+
+                            {
+
+                                found = true;
+
+                                break;
+
+                            }
+
+                        }
+
+                    }
+
+        
+
+                    if (!found)
+
+                    {
+
+                        AN_LOGW(TAG, "Credential not found: %s", ssid);
+
+                        request->send(404, "application/json", "{\"success\":false,\"message\":\"Credential not found\"}");
+
+                        return;
+
+                    }
+
+        
+
+                    AN_LOGI(TAG, "Initiating connection to saved credential: %s", ssid);
+
+        
+
+                    // Disconnect and connect (via callback)
+
+                    if (_onDisconnect != nullptr)
+
+                    {
+
+                        _onDisconnect();
+
+                    }
+
+        
+
+                    if (entry.enterprise)
+
+                    {
+
+                        if (_onConnectEnterprise != nullptr)
+
+                        {
+
+                            _onConnectEnterprise(entry.ssid.c_str(), entry.enterpriseNetId.c_str(), entry.password.c_str());
+
+                        }
+
+                    }
+
+                    else
+
+                    {
+
+                        if (_onConnect != nullptr)
+
+                        {
+
+                            _onConnect(entry.ssid.c_str(), entry.password.c_str(), false, &entry);
+
+                        }
+
+                    }
+
+        
+
+                    String response = "{\"success\":true,\"message\":\"Connection initiated to " + entry.ssid + "\"}";
+
+                    request->send(200, "application/json", response); });
+
+        
+
+            // Disconnect endpoint (/_an/disc) - Uses POST to prevent CSRF attacks
+
+            // Note: Supports both GET (for legacy compatibility) and POST (preferred)
+
+            _server->on("/_an/disc", HTTP_ANY, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                // Authentication check
+
+                if (_state.isAuthEnabled() &&
+
+                    !request->authenticate(_state.getAuthUsername().c_str(),
+
+                                           _state.getAuthPassword().c_str()))
+
+                {
+
+                    return request->requestAuthentication();
+
+                }
+
+        
+
+                AN_LOGI(TAG, "Manual disconnect requested. Starting portal.");
+
+        
+
+                // 1. Disconnect from WiFi
+
+                if (_onDisconnect != nullptr) {
+
+                    _onDisconnect();
+
+                }
+
+        
+
+                // 2. Immediately start the portal (which starts the AP)
+
+                start();
+
+        
+
+                // 3. Redirect to the portal's IP address
+
+                AsyncWebServerResponse* response = request->beginResponse(302, "text/plain", "Redirecting...");
+
+                response->addHeader("Location", "http://" + WiFi.softAPIP().toString() + "/_an");
+
+                request->send(response);
+
+            });
+
+        }
+
+        
+
+        void AutoNetworkPortal::_registerResetEndpoint()
+
+        {
+
+            // Reset endpoint (/_an/reset) - Uses POST to prevent CSRF attacks
+
+            _server->on("/_an/reset", HTTP_POST, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                AN_LOGI(TAG, "Reset requested");
+
+        
+
+                AutoNetworkRequestValidation validation{
+
+                    request,
+
+                    &_state,
+
+                    true,   // requireAuth
+
+                    false   // checkBusyState - reset allowed when busy
+
+                };
+
+        
+
+                if (!validation.validate(_state.getAuthUsername(), _state.getAuthPassword()))
+
+                {
+
+                    return;
+
+                }
+
+        
+
+                AN_LOGI(TAG, "Reset authorized - redirecting and restarting");
+
+        
+
+                // Send a server-side redirect to the root page
+
+                AsyncWebServerResponse* response = request->beginResponse(302, "text/plain", "Redirecting...");
+
+                response->addHeader("Location", "/");
+
+                request->send(response);
+
+        
+
+                // Restart the ESP32 after a short delay to allow the response to be sent
+
+                if (!_resetScheduled && _resetTaskHandle == nullptr) {
+
+                    _resetScheduled = true;
+
+                    xTaskCreate([](void* param) {
+
+                        vTaskDelay(pdMS_TO_TICKS(DELAY_RESET_TASK_MS)); // Short delay
+
+                        ESP.restart();
+
+                        // Note: vTaskDelete(NULL) not needed - ESP.restart() never returns
+
+                    }, "reset_task", 2048, NULL, 1, &_resetTaskHandle);
+
+                }
+
+            });
+
+        }
+
+        
+
+        void AutoNetworkPortal::_registerUserActiveEndpoint()
+
+        {
+
+            // Dedicated endpoint for JavaScript signal of genuine user interaction
+
+            _server->on("/user_active", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                // Mark the client's IP as active to indicate genuine user interaction.
+
+                // This prevents automated captive portal probes from triggering webpageAccessed.
+
+                _activeUsers.insert(request->client()->remoteIP()); // Access remoteIP via pointer
+
+                AN_LOGD(TAG, "Client %s marked as active via /user_active endpoint", request->client()->remoteIP().toString().c_str()); // Access remoteIP via pointer
+
+        
+
+                // Signal AutoNetwork that a user-facing page has been accessed.
+
+                // This triggers the OLED display transition to State 4.
+
+                if (_onSetWebpageAccessed != nullptr) {
+
+                    _onSetWebpageAccessed();
+
+                }
+
+                request->send(200, "text/plain", "OK"); });
+
+        }
+
+        
+
+        void AutoNetworkPortal::_registerCaptiveEndpoints()
+
+        {
+
+            // Android/Google connectivity probes
+
+            _server->on("/generate_204", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                AN_LOGV(TAG, "Android/Google connectivity probe detected");
+
+                request->redirect("/_an"); })
+
+                .setFilter(this->_onAPFilter);
+
+        
+
+            _server->on("/gen_204", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                AN_LOGV(TAG, "Android/Google connectivity probe detected");
+
+                request->redirect("/_an"); })
+
+                .setFilter(this->_onAPFilter);
+
+        
+
+            // Apple (iOS/macOS) connectivity probes
+
+            _server->on("/hotspot-detect.html", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                AN_LOGV(TAG, "Apple iOS/macOS connectivity probe detected");
+
+                request->redirect("/_an"); })
+
+                .setFilter(this->_onAPFilter);
+
+        
+
+            _server->on("/library/test/success.html", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                AN_LOGV(TAG, "Apple connectivity probe detected");
+
+                request->redirect("/_an"); })
+
+                .setFilter(this->_onAPFilter);
+
+        
+
+            // Microsoft Windows connectivity probes
+
+            _server->on("/ncsi.txt", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                AN_LOGV(TAG, "Windows NCSI connectivity probe detected");
+
+                request->redirect("/_an"); })
+
+                .setFilter(this->_onAPFilter);
+
+        
+
+            _server->on("/connecttest.txt", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                AN_LOGV(TAG, "Windows connectivity probe detected");
+
+                request->redirect("/_an"); })
+
+                .setFilter(this->_onAPFilter);
+
+        
+
+            _server->on("/fwlink", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                // Respond with 204 No Content to satisfy Windows captive portal probes without triggering webpageAccessed.
+
+                AN_LOGV(TAG, "Windows fwlink check - responding with 204 No Content");
+
+                request->send(204); })
+
+                .setFilter(this->_onAPFilter);
+
+        
+
+            // Catch-all handler for any unregistered URLs - redirects to main portal page
+
+            // Note: onNotFound() doesn't support setFilter(), so we check AP mode inside the handler
+
+            _server->onNotFound([&](AsyncWebServerRequest* request) {
+
+                // Only redirect to captive portal if request is on AP interface
+
+                // This prevents redirecting STA-mode requests to the captive portal
+
+                IPAddress clientIP = request->client()->remoteIP();
+
+                IPAddress apIP = WiFi.softAPIP();
+
+        
+
+                // Check if client is on AP network (192.168.4.x by default)
+
+                bool isAPClient = (clientIP[0] == apIP[0] && clientIP[1] == apIP[1] && clientIP[2] == apIP[2]);
+
+        
+
+                if (isAPClient)
+
+                {
+
+                    AN_LOGV(TAG, "Catch-all redirect (AP client): %s %s -> /_an",
+
+                            request->methodToString(),
+
+                            request->url().c_str());
+
+                    request->redirect("/_an");
+
+                }
+
+                else
+
+                {
+
+                    // For STA-mode clients, return 404
+
+                    AN_LOGV(TAG, "Not found (STA client): %s %s",
+
+                            request->methodToString(),
+
+                            request->url().c_str());
+
+                    request->send(404, "text/plain", "Not Found");
+
+                }
+
+            });
+
+        
+
+            AN_LOGD(TAG, "Registered catch-all redirect handler for captive portal");
+
+        }
+
+        
+
+        void AutoNetworkPortal::_registerMenuEndpoint()
+
+        {
+
+            // AutoNetwork Menu Page (/_an)
+
+            // IMPORTANT: This MUST be registered LAST after all /_an/* endpoints
+
+            // to avoid catching requests meant for more specific routes
+
+            _server->on("/_an", HTTP_GET, [&](AsyncWebServerRequest* request)
+
+                        {
+
+                AN_LOGD(TAG, "Menu page requested");
+
+        
+
+                String html = AUTONETWORK_MENU_HTML;
+
+        
+
+                if (WiFi.status() == WL_CONNECTED)
+
+                {
+
+                    html.replace("%STATUS%", "Connected");
+
+                    html.replace("%STATUS_CLASS%", "status-connected");
+
+                    html.replace("%SSID%", escapeHtml(WiFi.SSID()));
+
+                    html.replace("%IP%", WiFi.localIP().toString());
+
+                }
+
+                else
+
+                {
+
+                    html.replace("%STATUS%", "Disconnected");
+
+                    html.replace("%STATUS_CLASS%", "status-disconnected");
+
+                    html.replace("%SSID%", "None");
+
+                    html.replace("%IP%", WiFi.softAPIP().toString());
+
+                }
+
+        
+
+                // Get credential count via callback
+
+                uint8_t credCount = 0;
+
+                if (_onGetCredentialEntries != nullptr)
+
+                {
+
+                    credCount = _onGetCredentialEntries();
+
+                }
+
+                html.replace("%COUNT%", String(credCount));
+
+        
+
+                request->send(200, "text/html", html);
+
+            });
+
+        }
+
+        
+
+        void AutoNetworkPortal::_registerEndpoints()
+
+        {
+
+            AN_LOGI(TAG, "Registering HTTP endpoints...");
+
+        
+
+            // Root endpoint is now handled by AutoNetwork::_registerRootHandler()
+
+            _registerStaticResourceEndpoints();
+
+            _registerPortalPageEndpoint();
+
+            _registerInfoEndpoint();
+
+            _registerOTAEndpoints();
+
+            _registerScanEndpoint();
+
+            _registerWifiConnectEndpoint();
+
+            _registerSavedNetworksEndpoint();
+
+            _registerResetEndpoint();
+
+            _registerUserActiveEndpoint();
+
+            _registerCaptiveEndpoints();
+
+            // CRITICAL: Menu endpoint MUST be registered LAST to avoid catching /_an/* routes
+
+            _registerMenuEndpoint();
+
+        
+
+            AN_LOGI(TAG, "HTTP endpoints registered successfully");
+
+        }
+
+        
+
+        void AutoNetworkPortal::_unregisterEndpoints()
+
+        {
+
+            AN_LOGI(TAG, "Unregistering HTTP endpoints...");
+
+        
+
+            if (_index_handler != nullptr)
+
+            {
+
+                _server->removeHandler(_index_handler);
+
+                _index_handler = nullptr;
+
+            }
+
+        
+
+            if (_status_handler != nullptr)
+
+            {
+
+                _server->removeHandler(_status_handler);
+
+                _status_handler = nullptr;
+
+            }
+
+        
+
+            if (_schema_handler != nullptr)
+
+            {
+
+                _server->removeHandler(_schema_handler);
+
+                _schema_handler = nullptr;
+
+            }
+
+        
+
+            if (_scan_handler != nullptr)
+
+            {
+
+                _server->removeHandler(_scan_handler);
+
+                _scan_handler = nullptr;
+
+            }
+
+        
+
+            if (_save_handler != nullptr)
+
+            {
+
+                _server->removeHandler(_save_handler);
+
+                delete _save_handler;  // Fix memory leak - _save_handler is created with new
+
+                _save_handler = nullptr;
+
+            }
+
+        
+
+            if (_clear_handler != nullptr)
+
+            {
+
+                _server->removeHandler(_clear_handler);
+
+                _clear_handler = nullptr;
+
+            }
+
+        
+
+            if (_exit_handler != nullptr)
+
+            {
+
+                _server->removeHandler(_exit_handler);
+
+                _exit_handler = nullptr;
+
+            }
+
+        
+
+            AN_LOGI(TAG, "HTTP endpoints unregistered");
+
+        }
+
+        
+
+        // Private Methods - JSON Generation
+
+        // ****************************************************************************
+
+        
+
+        void AutoNetworkPortal::_generateStatusJson(String &str)
+
+        {
+
+            uint8_t status = 0;
+
+            String staSSID = "";
+
+        
+
+            if (_onGetStatus != nullptr)
+
+            {
+
+                status = _onGetStatus();
+
+            }
+
+        
+
+            if (_onGetSTASSID != nullptr)
+
+            {
+
+                staSSID = _onGetSTASSID();
+
+            }
+
+        
+
+            AutoNetworkJsonBuilder::buildStatusJson(
+
+                str,
+
+                status,
+
+                (WiFi.status() == WL_CONNECTED),
+
+                staSSID,
+
+                WiFi.macAddress(),
+
+                WiFi.localIP().toString(),
+
+                (uint8_t)_state.getState(),
+
+                _state.isActive());
+
+        }
+
+        
+
+        void AutoNetworkPortal::_generateSchemaJson(String &str)
+
+        {
+
+            extern struct AutoNetworkParameterTypeNames paramTypes[];
+
+        
+
+            AutoNetworkJsonBuilder::buildSchemaJson(
+
+                str,
+
+                _state.getParameters().Data(),
+
+                _state.getParameters().Size(),
+
+                paramTypes);
+
+        }
+
+        
+
+        void AutoNetworkPortal::_generateScanJson(String &str)
+
+        {
+
+            JsonDocument json;
+
+        
+
+            JsonArray arr = json.to<JsonArray>();
+
+        
+
+            // Check if scan completed successfully (negative values indicate running/failed)
+
+            int16_t scanCount = WiFi.scanComplete();
+
+            if (scanCount <= 0)
+
+            {
+
+                // Return empty array for running/failed scans
+
+                serializeJson(json, str);
+
+                json.clear();
+
+                return;
+
+            }
+
+        
+
+            for (uint16_t i = 0; i < std::min((uint16_t)scanCount, (uint16_t)MAX_SCAN_RESULTS); i++)
+
+            {
+
+                JsonObject obj = arr.add<JsonObject>();
+
+                obj["s"] = WiFi.SSID(i);
+
+                obj["b"] = WiFi.BSSIDstr(i);
+
+                obj["r"] = WiFi.RSSI(i);
+
+                obj["c"] = WiFi.channel(i);
+
+        
+
+                AutoNetworkEncryptionType enc = AutoNetworkEncryptionType::OPEN;
+
+                switch (WiFi.encryptionType(i))
+
+                {
+
+                case WIFI_AUTH_OPEN:
+
+                    enc = AutoNetworkEncryptionType::OPEN;
+
+                    break;
+
+                case WIFI_AUTH_WEP:
+
+                    enc = AutoNetworkEncryptionType::WEP;
+
+                    break;
+
+                case WIFI_AUTH_WPA_PSK:
+
+                    enc = AutoNetworkEncryptionType::WPA_PSK;
+
+                    break;
+
+                case WIFI_AUTH_WPA2_PSK:
+
+                    enc = AutoNetworkEncryptionType::WPA2_PSK;
+
+                    break;
+
+                case WIFI_AUTH_WPA_WPA2_PSK:
+
+                    enc = AutoNetworkEncryptionType::WPA_WPA2_PSK;
+
+                    break;
+
+                case WIFI_AUTH_WPA2_ENTERPRISE:
+
+                    enc = AutoNetworkEncryptionType::WPA2_ENTERPRISE;
+
+                    break;
+
+                case WIFI_AUTH_WPA3_PSK:
+
+                    enc = AutoNetworkEncryptionType::WPA3_PSK;
+
+                    break;
+
+                case WIFI_AUTH_WPA2_WPA3_PSK:
+
+                    enc = AutoNetworkEncryptionType::WPA2_WPA3_PSK;
+
+                    break;
+
+                case WIFI_AUTH_WAPI_PSK:
+
+                    enc = AutoNetworkEncryptionType::WAPI_PSK;
+
+                    break;
+
+                case WIFI_AUTH_WPA3_ENT_192:
+
+                    enc = AutoNetworkEncryptionType::WPA3_ENT_192;
+
+                    break;
+
+                case WIFI_AUTH_MAX:
+
+                    enc = AutoNetworkEncryptionType::MAX;
+
+                    break;
+
+                default:
+
+                    enc = AutoNetworkEncryptionType::UNKNOWN;
+
+                    break;
+
+                }
+
+                obj["e"] = (uint8_t)enc;
+
+            }
+
+            serializeJson(json, str);
+
+            json.clear();
+
+        }
+
+        
+
+        // Private Methods - JSON Parsing
+
+        // ****************************************************************************
+
+        
+
+        bool AutoNetworkPortal::_parseConfigJson(JsonArray &arr)
+
+        {
+
+            // Validate parameters
+
+            for (uint8_t i = 0; i < arr.size(); i++)
+
+            {
+
+                JsonObject obj = arr[i];
+
+        
+
+                if (!obj["id"].is<JsonVariant>() || !obj["v"].is<JsonVariant>())
+
+                {
+
+                    return false;
+
+                }
+
+        
+
+                if (!obj["v"].is<const char*>())
+
+                {
+
+                    return false;
+
+                }
+
+            }
+
+        
+
+            // Parse parameters
+
+            for (uint8_t i = 0; i < arr.size(); i++)
+
+            {
+
+                JsonObject obj = arr[i];
+
+                for (int j = 0; j < _state.getParameters().Size(); j++)
+
+                {
+
+                    AutoNetworkParameter* p = _state.getParameters()[j];
+
+                    if (p->_id == obj["id"].as<uint32_t>())
+
+                    {
+
+                        p->_value = obj["v"].as<const char*>();
+
+                        break;
+
+                    }
+
+                }
+
+            }
+
+        
+
+            if (_state.getConfigCallback() != nullptr)
+
+            {
+
+                return _state.getConfigCallback()();
+
+            }
+
+            else
+
+            {
+
+                return true;
+
+            }
+
+        }
+
+        
+
+        bool AutoNetworkPortal::_parseCredentialsJson(JsonObject &obj)
+
+        {
+
+            if (obj["ssid"].is<const char*>() && obj["password"].is<const char*>())
+
+            {
+
+                const char* ssid = obj["ssid"].as<const char*>();
+
+                const char* password = obj["password"].as<const char*>();
+
+        
+
+                // Validate SSID and password are not null
+
+                if (ssid == nullptr || password == nullptr)
+
+                {
+
+                    AN_LOGW(TAG, "Invalid credentials: null SSID or password");
+
+                    return false;
+
+                }
+
+        
+
+                // Validate SSID length (max 32 bytes per WiFi spec)
+
+                size_t ssidLen = strlen(ssid);
+
+                if (ssidLen == 0 || ssidLen > 32)
+
+                {
+
+                    AN_LOGW(TAG, "Invalid SSID length: %u (must be 1-32)", ssidLen);
+
+                    return false;
+
+                }
+
+        
+
+                // Validate password length (WPA2: 8-63 characters, or empty for open networks)
+
+                size_t passLen = strlen(password);
+
+                if (passLen > 0 && (passLen < 8 || passLen > 63))
+
+                {
+
+                    AN_LOGW(TAG, "Invalid password length: %u (must be 0 or 8-63)", passLen);
+
+                    return false;
+
+                }
+
+        
+
+                // Sanitize SSID input to prevent XSS (defense in depth)
+
+                String sanitizedSSID = sanitizeInput(String(ssid));
+
+                if (sanitizedSSID.length() == 0)
+
+                {
+
+                    AN_LOGW(TAG, "SSID became empty after sanitization");
+
+                    return false;
+
+                }
+
+        
+
+                _state.setSTASSID(sanitizedSSID.c_str());
+
+                _state.setSTAPassword(password);  // Password doesn't need sanitization (not displayed in HTML)
+
+                _state.setSTAChannel(0);
+
+        
+
+                // Parse BSSID if present - with bounds-safe parsing
+
+                if (obj["bssid"].is<const char*>())
+
+                {
+
+                    const char* bssidStr = obj["bssid"].as<const char*>();
+
+                    // Validate bssidStr is not null and has exact length (17 chars: XX:XX:XX:XX:XX:XX)
+
+                    // Use strnlen to prevent unbounded reads on malformed input
+
+                    if (bssidStr != nullptr && strnlen(bssidStr, 32) == 17)
+
+                    {
+
+                        // Use uint32_t values to detect overflow (values > 0xFF)
+
+                        uint32_t values[6];
+
+                        if (sscanf(bssidStr, "%2x:%2x:%2x:%2x:%2x:%2x",
+
+                                   &values[0], &values[1], &values[2],
+
+                                   &values[3], &values[4], &values[5]) == 6)
+
+                        {
+
+                            // Validate all values are within byte range
+
+                            bool valid = true;
+
+                            for (uint8_t i = 0; i < 6; i++) {
+
+                                if (values[i] > 0xFF) {
+
+                                    valid = false;
+
+                                    break;
+
+                                }
+
+                            }
+
+                            if (valid) {
+
+                                uint8_t bssid[AUTONETWORK_BSSID_LENGTH];
+
+                                for (uint8_t i = 0; i < 6; i++) {
+
+                                    bssid[i] = (uint8_t)values[i];
+
+                                }
+
+                                _state.setSTABSSID(bssid);
+
+                            } else {
+
+                                AN_LOGW(TAG, "Invalid BSSID byte values: %s", bssidStr);
+
+                                _state.setSTABSSID(nullptr);
+
+                            }
+
+                        }
+
+                        else
+
+                        {
+
+                            AN_LOGW(TAG, "Invalid BSSID format: %s", bssidStr);
+
+                            _state.setSTABSSID(nullptr);
+
+                        }
+
+                    }
+
+                    else
+
+                    {
+
+                        _state.setSTABSSID(nullptr);
+
+                    }
+
+                }
+
+                else
+
+                {
+
+                    _state.setSTABSSID(nullptr);
+
+                }
+
+        
+
+                // Set manual connection flag
+
+                _state.setManualConnection(true);
+
+        
+
+                // Parse enterprise fields if present
+
+                if (obj["enterprise"].is<bool>() && obj["enterprise"].as<bool>())
+
+                {
+
+                    _state.setEnterpriseMode(true);
+
+                    if (obj["netid"].is<const char*>())
+
+                    {
+
+                        _state.setEnterpriseNetId(obj["netid"].as<const char*>());
+
+                        AN_LOGI(TAG, "Enterprise credentials parsed");
+
+                        AN_LOGD(TAG, "Enterprise - NetID: %s",
+
+                                 _state.getEnterpriseNetId().c_str());
+
+                    }
+
+                }
+
+                else
+
+                {
+
+                    _state.setEnterpriseMode(false);
+
+                    _state.setEnterpriseNetId("");
+
+                }
+
+        
+
+                // Set portal state
+
+                _state.setState(AutoNetworkPortalState::CONNECTING_WIFI);
+
+                AN_LOGI(TAG, "Starting WiFi connection to SSID: %s (Ent: %s)",
+
+                         _state.getSTASSID().c_str(),
+
+                         _state.isEnterpriseMode() ? "Yes" : "No");
+
+        
+
+                return true;
+
+            }
+
+            else
+
+            {
+
+                return false;
+
+            }
+
+        }
+
+        
+
+        // Private Methods - Credential Management
+
+        // ****************************************************************************
+
+        
+
+        bool AutoNetworkPortal::_saveCredentialEntry(const AutoNetworkCredentialEntry &entry)
+
+        {
+
+            // Check credential limit before saving (via callback)
+
+            if (_onGetCredentialEntries != nullptr && _onGetConfig != nullptr)
+
+            {
+
+                uint8_t currentCount = _onGetCredentialEntries();
+
+                const AutoNetworkConfig &config = _onGetConfig();
+
+        
+
+                if (currentCount >= config.credentialsMax)
+
+                {
+
+                    AN_LOGW(TAG, "Credential limit reached (%d/%d) - oldest credential will be replaced",
+
+                             currentCount, config.credentialsMax);
+
+        
+
+                    // Find and delete oldest credential (lowest lastUsed timestamp)
+
+                    AutoNetworkCredentialEntry oldestEntry;
+
+                    if (_onGetCredentialByRecent != nullptr && _onGetCredentialByRecent(config.credentialsMax - 1, oldestEntry))
+
+                    {
+
+                        if (_onDeleteCredential != nullptr)
+
+                        {
+
+                            _onDeleteCredential(oldestEntry.ssid.c_str());
+
+                            AN_LOGI(TAG, "Deleted oldest credential: %s (lastUsed=%lu)",
+
+                                     oldestEntry.ssid.c_str(), oldestEntry.lastUsed);
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        
+
+            if (_onSaveCredential != nullptr && _onSaveCredential(entry))
+
+            {
+
+                AN_LOGI(TAG, "Saved new credential: %s (lastUsed=%lu)", entry.ssid.c_str(), entry.lastUsed);
+
+                return true;
+
+            }
+
+            else
+
+            {
+
+                AN_LOGE(TAG, "Failed to save credential: %s", entry.ssid.c_str());
+
+                return false;
+
+            }
+
+        }
+
+        
+
+        // Private Methods - WiFi Scanning
+
+        // ****************************************************************************
+
+        
+
+        void AutoNetworkPortal::_restartScan()
+
+        {
+
+            AN_LOGI(TAG, "[AutoNetworkPortal] _restartScan() called");
+
+            if (_onRequestScan != nullptr)
+
+            {
+
+                AN_LOGI(TAG, "[AutoNetworkPortal] Delegating scan request to parent");
+
+                _onRequestScan();
+
+            }
+
+            else
+
+            {
+
+                AN_LOGE(TAG, "[AutoNetworkPortal] Scan request failed: _onRequestScan callback is not set!");
+
+            }
+
+        }
+
+        
+
+        // Private Methods - Request Filtering
+
+        // ****************************************************************************
+
+        
+
+        bool AutoNetworkPortal::_onAPFilter(AsyncWebServerRequest* request)
+
+        {
+
+            // Allow requests when portal is active (stations connected to AP)
+
+            return WiFi.softAPgetStationNum() > 0;
+
+        }
+
+        

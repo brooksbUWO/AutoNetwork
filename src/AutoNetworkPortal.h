@@ -854,6 +854,12 @@ private:
     PortalIsConfiguredCallback _onIsConfigured = nullptr;
     PortalSetWebpageAccessedCallback _onSetWebpageAccessed = nullptr;
 
+    // OTA State
+    // ========================================================================
+    bool _resetScheduled;
+    TaskHandle_t _resetTaskHandle;
+    int32_t _lastOTAProgress;
+
     // Private Methods - HTTP Server Management
     // ========================================================================
 

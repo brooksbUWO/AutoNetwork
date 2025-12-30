@@ -56,7 +56,7 @@ struct AutoNetworkCredentialEntry
     String password;            /**< Network password (PSK or Enterprise password). */
     bool enterprise;            /**< True if WPA2 Enterprise, false for WPA2-PSK. */
     String enterpriseNetId;     /**< Enterprise network identity (username for PEAP/MSCHAPv2). */
-    uint32_t lastUsed;          /**< Last connection timestamp (monotonic time). */
+    uint64_t lastUsed;          /**< Last connection timestamp (monotonic time). */
     uint8_t priority;           /**< Connection priority (0 = highest priority). */
 
     // Network configuration (for static IP support)
@@ -292,7 +292,7 @@ public:
      * @return true if update succeeded.
      * @return false if SSID not found or update failed.
      */
-    bool updateLastUsed(const char *ssid, uint32_t timestamp);
+    bool updateLastUsed(const char *ssid, uint64_t timestamp);
 
     /**
      * @brief Update priority for credential.
